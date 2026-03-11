@@ -1,0 +1,112 @@
+.secure-navbar {
+  background: linear-gradient(120deg, rgba(8, 20, 35, 0.95), rgba(18, 40, 68, 0.94));
+  border-bottom: 1px solid rgba(90, 138, 188, 0.35);
+  backdrop-filter: blur(8px);
+  min-height: 68px;
+  box-shadow: 0 8px 20px rgba(3, 9, 18, 0.42);
+}
+
+.secure-navbar-inner {
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
+.secure-brand {
+  color: #e7f4ff !important;
+  font-family: var(--font-heading);
+  font-size: 1.45rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.secure-nav-links {
+  gap: 8px;
+  align-items: center;
+}
+
+.secure-nav-link {
+  color: #b8d5ef !important;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 0.4rem 0.9rem !important;
+  font-weight: 600;
+  transition: all 0.2s ease;
+}
+
+.secure-nav-link:hover,
+.secure-nav-link:focus {
+  color: #e7f4ff !important;
+  border-color: rgba(99, 146, 195, 0.45);
+  background: rgba(28, 58, 90, 0.45);
+}
+
+.secure-nav-link.active {
+  color: #f7fcff !important;
+  border-color: rgba(36, 219, 226, 0.6);
+  background: rgba(36, 219, 226, 0.15);
+}
+
+.secure-auth-links .auth-link {
+  border-color: rgba(92, 134, 178, 0.4);
+}
+
+.secure-auth-links .auth-link.highlight {
+  border-color: rgba(71, 229, 146, 0.7);
+  background: rgba(71, 229, 146, 0.16);
+  color: #d6ffe9 !important;
+}
+
+.secure-dropdown .dropdown-toggle {
+  color: #b8d5ef !important;
+  border-radius: 999px;
+  border: 1px solid rgba(92, 134, 178, 0.3);
+  padding: 0.4rem 0.9rem !important;
+  font-weight: 600;
+}
+
+.secure-dropdown .dropdown-toggle:hover,
+.secure-dropdown .dropdown-toggle:focus,
+.secure-dropdown.show .dropdown-toggle {
+  color: #f1fbff !important;
+  background: rgba(25, 54, 84, 0.5);
+  border-color: rgba(36, 219, 226, 0.58);
+}
+
+.secure-dropdown .dropdown-menu {
+  background: rgba(10, 23, 41, 0.98);
+  border: 1px solid rgba(87, 130, 176, 0.45);
+  border-radius: 12px;
+  box-shadow: 0 10px 24px rgba(4, 11, 20, 0.55);
+  padding: 6px;
+}
+
+.secure-dropdown .dropdown-item {
+  color: #cbe2f7;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  padding: 0.5rem 0.7rem;
+}
+
+.secure-dropdown .dropdown-item:hover,
+.secure-dropdown .dropdown-item:focus,
+.secure-dropdown .dropdown-item.active {
+  color: #f6fbff;
+  background: rgba(36, 219, 226, 0.18);
+}
+
+.secure-toggler.navbar-toggler {
+  border-color: rgba(118, 158, 199, 0.45);
+}
+
+@media (max-width: 991px) {
+  .secure-nav-links {
+    margin-top: 8px;
+  }
+
+  .secure-auth-links {
+    margin-top: 4px;
+    padding-bottom: 8px;
+  }
+}
