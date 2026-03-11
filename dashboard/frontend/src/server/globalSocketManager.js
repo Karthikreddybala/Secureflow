@@ -1,153 +1,138 @@
-import { socketManager } from './socket';
-import chartDataManager from './chartDataManager';
+import { socketManager } from './socket'
+import chartDataManager from './chartDataManager'
 
-// Global socket manager singleton that connects once and updates Redux globally
+const normalizeProtocolLabel = (value) => {
+  const protocol = String(value ?? 'Unknown').toUpperCase()
+  if (protocol === '6' || protocol === 'TCP') return 'TCP'
+  if (protocol === '17' || protocol === 'UDP') return 'UDP'
+  if (protocol === '1' || protocol === 'ICMP') return 'ICMP'
+  return 'Other'
+}
+
+const isNormalTrafficAlert = (alert) => {
+  const attackType = String(alert?.final?.attack_type ?? '').toLowerCase()
+  return attackType === 'normal'
+}
+
 class GlobalSocketManager {
   constructor() {
     if (GlobalSocketManager.instance) {
-      return GlobalSocketManager.instance;
+      return GlobalSocketManager.instance
     }
-    
-    this.isConnected = false;
-    this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 10;
-    this.reconnectInterval = 3000;
-    this.dispatch = null;
-    
-    GlobalSocketManager.instance = this;
-    return this;
+
+    this.dispatch = null
+    this.initialized = false
+    this.connected = false
+
+    this.handleAlertMessage = null
+    this.handleNetworkMessage = null
+    this.handleConnectionStatus = null
+
+    GlobalSocketManager.instance = this
+    return this
   }
 
-  // Initialize global socket connections with Redux dispatch
   init(dispatch) {
-    if (this.dispatch) return; // Already initialized
-    
-    this.dispatch = dispatch;
-    this.setupGlobalHandlers();
-    this.connect();
+    if (this.initialized) {
+      return
+    }
+
+    this.dispatch = dispatch
+    this.setupGlobalHandlers()
+    this.connect()
+    this.initialized = true
   }
 
   setupGlobalHandlers() {
-    // Global alert message handler
-    const handleAlertMessage = (data) => {
-      if (this.dispatch) {
-        this.dispatch({
-          type: 'alerts/addAlert',
-          payload: {
-            ...data,
-            id: Date.now() + Math.random(),
-            timestamp: data.timestamp || Date.now()
-          }
-        });
+    this.handleAlertMessage = (data) => {
+      if (!this.dispatch) return
 
-        // Update chart data manager for alerts
-        chartDataManager.updateNetworkTraffic(data, true);
-        chartDataManager.updateProtocolFromAlert(data);
-        chartDataManager.updateAttackData(true); // Mark as attack
-      }
-    };
+      this.dispatch({
+        type: 'alerts/addAlert',
+        payload: data
+      })
 
-    // Global network message handler
-    const handleNetworkMessage = (data) => {
-      if (this.dispatch) {
-        // Update network data
-        const networkData = Array.isArray(data) ? data : [data];
-        this.dispatch({
-          type: 'networkData/addNetworkData',
-          payload: networkData
-        });
+      chartDataManager.updateNetworkTraffic(data, true)
+      chartDataManager.updateProtocolFromAlert(data)
+      chartDataManager.updateAttackData(!isNormalTrafficAlert(data))
+    }
 
-        // Update chart data manager (for persistent charts)
-        chartDataManager.updateNetworkTraffic(data, false);
-        chartDataManager.updateProtocolData(data);
+    this.handleNetworkMessage = (data) => {
+      if (!this.dispatch) return
 
-        // Update chart data in Redux (for other components)
-        const packetCount = networkData.length;
-        this.dispatch({
-          type: 'chartData/updateNetworkTrafficData',
-          payload: { count: packetCount }
-        });
+      const packets = Array.isArray(data) ? data : [data]
+      if (packets.length === 0) return
 
-        // Update protocol distribution in Redux
-        networkData.forEach(packet => {
-          const protocol = String(packet.proto || 'Unknown');
-          this.dispatch({
-            type: 'chartData/updateProtocolDistribution',
-            payload: { protocol, increment: 1 }
-          });
-        });
-      }
-    };
+      this.dispatch({
+        type: 'networkData/addNetworkData',
+        payload: packets
+      })
 
-    // Global connection status handler
-    const handleConnectionStatus = (status) => {
-      if (this.dispatch) {
-        this.dispatch({
-          type: 'connectionStatus/setAlertConnected',
-          payload: status.isAlertConnected
-        });
-        this.dispatch({
-          type: 'connectionStatus/setNetworkConnected', 
-          payload: status.isNetworkConnected
-        });
-      }
-    };
+      chartDataManager.updateNetworkTraffic(packets, false)
+      chartDataManager.updateProtocolData(packets)
 
-    // Add handlers to socket manager
-    socketManager.addAlertMessageHandler(handleAlertMessage);
-    socketManager.addNetworkMessageHandler(handleNetworkMessage);
-    socketManager.addConnectionStatusHandler(handleConnectionStatus);
+      this.dispatch({
+        type: 'chartData/updateNetworkTrafficData',
+        payload: { count: packets.length }
+      })
+
+      const protocolCounts = packets.reduce((accumulator, packet) => {
+        const protocol = normalizeProtocolLabel(packet?.proto ?? packet?.protocol)
+        accumulator[protocol] = (accumulator[protocol] || 0) + 1
+        return accumulator
+      }, {})
+
+      this.dispatch({
+        type: 'chartData/updateProtocolDistributionBatch',
+        payload: protocolCounts
+      })
+    }
+
+    this.handleConnectionStatus = (status) => {
+      if (!this.dispatch) return
+
+      this.dispatch({
+        type: 'connectionStatus/setAlertConnected',
+        payload: status.isAlertConnected
+      })
+
+      this.dispatch({
+        type: 'connectionStatus/setNetworkConnected',
+        payload: status.isNetworkConnected
+      })
+    }
+
+    socketManager.addAlertMessageHandler(this.handleAlertMessage)
+    socketManager.addNetworkMessageHandler(this.handleNetworkMessage)
+    socketManager.addConnectionStatusHandler(this.handleConnectionStatus)
   }
 
   connect() {
-    if (this.isConnected) return;
+    if (this.connected) return
 
-    try {
-      socketManager.connect();
-      this.isConnected = true;
-      this.reconnectAttempts = 0;
-      console.log('Global socket manager connected');
-    } catch (error) {
-      console.error('Global socket connection failed:', error);
-      this.handleReconnection();
-    }
+    socketManager.connect()
+    this.connected = true
   }
 
   disconnect() {
-    if (this.isConnected) {
-      socketManager.disconnect();
-      this.isConnected = false;
-      console.log('Global socket manager disconnected');
-    }
-  }
-
-  handleReconnection() {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('Max reconnection attempts reached');
-      return;
+    if (this.handleAlertMessage) {
+      socketManager.removeAlertMessageHandler(this.handleAlertMessage)
     }
 
-    this.reconnectAttempts++;
-    const delay = this.reconnectAttempts * this.reconnectInterval;
-    
-    console.log(`Attempting to reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`);
-    
-    setTimeout(() => {
-      this.connect();
-    }, delay);
-  }
+    if (this.handleNetworkMessage) {
+      socketManager.removeNetworkMessageHandler(this.handleNetworkMessage)
+    }
 
-  // Get connection status
-  getStatus() {
-    return {
-      isConnected: this.isConnected,
-      reconnectAttempts: this.reconnectAttempts,
-      maxReconnectAttempts: this.maxReconnectAttempts
-    };
+    if (this.handleConnectionStatus) {
+      socketManager.removeConnectionStatusHandler(this.handleConnectionStatus)
+    }
+
+    socketManager.disconnect()
+    this.connected = false
+    this.initialized = false
+    this.dispatch = null
   }
 }
 
-// Create singleton instance
-const globalSocketManager = new GlobalSocketManager();
-
-export default globalSocketManager;
+const globalSocketManager = new GlobalSocketManager()
+export default globalSocketManager

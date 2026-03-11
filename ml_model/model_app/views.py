@@ -1,529 +1,416 @@
-from django.shortcuts import render
 import json
+import logging
+import threading
+import time
+from pathlib import Path
+
 import joblib
+import numpy as np
 import pandas as pd
-import requests
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from channels.layers import get_channel_layer
-from asgiref.sync import async_to_sync, sync_to_async
-import sys
-import subprocess
-import os
-import time
-import numpy as np
-import asyncio
-import logging
 
-# Set up logging
 logger = logging.getLogger(__name__)
 
-# Create a task queue for background processing
-processing_queue = asyncio.Queue()
+MODEL_ROOT = Path(__file__).resolve().parents[1] / 'ai_models' / 'models'
+RF_MODEL_PATH = MODEL_ROOT / 'rf.plk'
+ISO_MODEL_PATH = MODEL_ROOT / 'isolation_forest.pkl'
 
+# Model feature list retained exactly as expected by the trained models.
+FEATURES = [
+    ' Flow Duration', ' Total Fwd Packets', ' Total Backward Packets', 'Total Length of Fwd Packets',
+    ' Total Length of Bwd Packets', ' Fwd Packet Length Mean', ' Bwd Packet Length Mean', 'Flow Bytes/s',
+    ' Flow Packets/s', ' Flow IAT Mean', ' Flow IAT Std', 'Fwd IAT Total', ' Fwd IAT Mean', ' Fwd IAT Std',
+    'Bwd IAT Total', ' Bwd IAT Mean', ' Bwd IAT Std', 'Fwd PSH Flags', ' Bwd PSH Flags', ' Fwd URG Flags',
+    ' Bwd URG Flags', ' Fwd Header Length', ' Bwd Header Length', 'Fwd Packets/s', ' Bwd Packets/s',
+    ' Packet Length Mean', ' Packet Length Std', ' Packet Length Variance', 'FIN Flag Count', ' SYN Flag Count',
+    ' RST Flag Count', ' PSH Flag Count', ' ACK Flag Count', ' Average Packet Size', ' Avg Fwd Segment Size',
+    ' Avg Bwd Segment Size', ' Fwd Header Length.1', ' act_data_pkt_fwd', ' min_seg_size_forward',
+    'Active Mean', ' Active Std', ' Active Max', ' Active Min', 'Idle Mean', ' Idle Std', ' Idle Max', ' Idle Min'
+]
+
+# Flow processing settings tuned for smoother real-time response.
+FLOW_TIMEOUT = 8.0
+MIN_PACKETS_FOR_PROCESSING = 5
+MAX_FLOW_PACKETS = 120
+ACTIVE_FLOW_FLUSH_INTERVAL = 2.0
+MAX_Y_ALERT_SCORE = 100.0
+
+rf = joblib.load(RF_MODEL_PATH)
+iso = joblib.load(ISO_MODEL_PATH)
 
 flows = {}
+flows_lock = threading.Lock()
 
-# Flow processing configuration
-FLOW_TIMEOUT = 15  # Increased from 3 to 15 seconds for better data accumulation
-MIN_PACKETS_FOR_PROCESSING = 5  # Minimum packets required before processing a flow
-MAX_FLOW_SIZE = 1000  # Maximum packets per flow before forced processing
-
-# Load ML models
-rf = joblib.load("C:\\Users\\saket\\3-2Mini\\secureflow\\ml_model\\ai_models\\models\\rf.plk")
-iso = joblib.load("C:\\Users\\saket\\3-2Mini\\secureflow\\ml_model\\ai_models\\models\\isolation_forest.pkl")
-FEATURES = [" Flow Duration", " Total Fwd Packets", " Total Backward Packets", "Total Length of Fwd Packets", " Total Length of Bwd Packets", " Fwd Packet Length Mean", " Bwd Packet Length Mean", "Flow Bytes/s", " Flow Packets/s", " Flow IAT Mean", " Flow IAT Std", "Fwd IAT Total", " Fwd IAT Mean", " Fwd IAT Std", "Bwd IAT Total", " Bwd IAT Mean", " Bwd IAT Std", "Fwd PSH Flags", " Bwd PSH Flags", " Fwd URG Flags", " Bwd URG Flags", " Fwd Header Length", " Bwd Header Length", "Fwd Packets/s", " Bwd Packets/s", " Packet Length Mean", " Packet Length Std", " Packet Length Variance", "FIN Flag Count", " SYN Flag Count", " RST Flag Count", " PSH Flag Count", " ACK Flag Count", " Average Packet Size", " Avg Fwd Segment Size", " Avg Bwd Segment Size", " Fwd Header Length.1", " act_data_pkt_fwd", " min_seg_size_forward", "Active Mean", " Active Std", " Active Max", " Active Min", "Idle Mean", " Idle Std", " Idle Max", " Idle Min"]  # 46 ordered feature list
-
-# Performance monitoring
 processing_stats = {
-    "flows_processed": 0,
-    "packets_processed": 0,
-    "avg_processing_time": 0.0,
-    "queue_depth": 0,
-    "start_time": time.time()
+    'flows_processed': 0,
+    'packets_processed': 0,
+    'alerts_emitted': 0,
+    'avg_processing_time_ms': 0.0,
+    'start_time': time.time()
 }
 
 
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
 
 
-def fusion_engine(rf_label, rf_conf, iso_score):
-    """
-    Combines RandomForest + IsolationForest signals to produce:
-    - final_score
-    - severity
-    - attack_type
-    
-    Now sends alerts for ALL flows (including normal ones) to dashboard.
-    """
-    # If RF predicts attack → trust RF
-    if rf_label != "Normal":
-        severity = "High" if rf_conf > 0.80 else "Medium"
-        return {
-            "final_score": round(float(rf_conf * 100), 2),
-            "attack_type": rf_label,
-            "severity": severity
-        }
+def _protocol_label(value):
+    protocol = str(value).upper()
+    if protocol == '6':
+        return 'TCP'
+    if protocol == '17':
+        return 'UDP'
+    if protocol == '1':
+        return 'ICMP'
+    return protocol
 
-    # Otherwise, trust Isolation Forest
-    if iso_score > 0.3:
-        return {
-            "final_score": iso_score,
-            "attack_type": "Anomaly",
-            "severity": "Medium"
-        }
 
-    # Send alert for normal flows too (changed from returning None)
-    return {
-        "final_score": iso_score,
-        "attack_type": "Normal",
-        "severity": "Low"
-    }
-
-def flow_id(pkt):
+def _flow_id(packet):
+    keys = ('src', 'dst', 'sport', 'dport', 'proto')
+    if any(key not in packet for key in keys):
+        return None
 
     return (
-        pkt["src"],
-        pkt["dst"],
-        pkt["sport"],
-        pkt["dport"],
-        pkt["proto"]
+        str(packet.get('src', 'Unknown')),
+        str(packet.get('dst', 'Unknown')),
+        str(packet.get('sport', '')),
+        str(packet.get('dport', '')),
+        str(packet.get('proto', 'Unknown'))
     )
 
 
-def process_packet(pkt):
-    fid = flow_id(pkt)
-    if not fid:
-        return
-    
-    now = time.time()
-    size = len(pkt)
-
-    if fid not in flows:
-        flows[fid] = {
-            "timestamps": [],
-            "sizes": [],
-            "fwd_sizes": [],
-            "bwd_sizes": [],
-            "flags": [],
-            "fwd_hdr_len": [],
-            "bwd_hdr_len": [],
-            "src": fid[0],
-            "last": now
+def fusion_engine(rf_label, rf_confidence, iso_score):
+    if str(rf_label).lower() != 'normal':
+        severity = 'High' if rf_confidence >= 0.80 else 'Medium'
+        return {
+            'final_score': round(min(MAX_Y_ALERT_SCORE, rf_confidence * 100.0), 2),
+            'attack_type': str(rf_label),
+            'severity': severity
         }
 
-    f = flows[fid]
-    direction = "fwd" if pkt["src"] == f["src"] else "bwd"
+    if iso_score > 0.3:
+        return {
+            'final_score': round(min(MAX_Y_ALERT_SCORE, iso_score * 100.0), 2),
+            'attack_type': 'Anomaly',
+            'severity': 'Medium'
+        }
 
-    # GENERAL
-    f["timestamps"].append(now)
-    f["sizes"].append(size)
-
-    # LENGTHS
-    if direction == "fwd":
-        f["fwd_sizes"].append(size)
-    else:
-        f["bwd_sizes"].append(size)
-
-    # FLAGS
-    # if pkt.haslayer("TCP"):
-    #     flags = pkt.sprintf("%TCP.flags%")
-    #     for fl in flags:
-    #         f["flags"].append(fl)
-
-    # # HEADER LENGTHS
-    # if pkt.haslayer("IP"):
-    #     hlen = pkt["IP"].ihl * 4
-    #     if direction == "fwd":
-    #         f["fwd_hdr_len"].append(hlen)
-    #     else:
-    #         f["bwd_hdr_len"].append(hlen)
-
-    # f["last"] = now
-
-
-def compute_features(f):
-    t = f["timestamps"]
-    dur = (t[-1] - t[0]) if len(t) > 1 else 0.001
-    sizes = f["sizes"]
-    iats = np.diff(t) if len(t) > 1 else [0]
-
-    fwd = f["fwd_sizes"]
-    bwd = f["bwd_sizes"]
-
-    # Prevent division by zero
-    dur_safe = max(dur, 0.001)
-    total_packets = len(sizes)
-    total_packets_safe = max(total_packets, 1)
-
+    # Explicitly emit normal traffic alerts so dashboard always shows them.
     return {
-        # Duration + basic counts
-        "Flow Duration": dur,
-        "Total Fwd Packets": len(fwd),
-        "Total Backward Packets": len(bwd),
-        "Total Length of Fwd Packets": sum(fwd),
-        "Total Length of Bwd Packets": sum(bwd),
-        "Fwd Packet Length Mean": np.mean(fwd) if fwd else 0,
-        "Bwd Packet Length Mean": np.mean(bwd) if bwd else 0,
-
-        # Rates - use safe duration to prevent division by zero
-        "Flow Bytes/s": sum(sizes) / dur_safe,
-        "Flow Packets/s": total_packets / dur_safe,
-
-        # IAT
-        "Flow IAT Mean": np.mean(iats) if len(iats) > 0 else 0,
-        "Flow IAT Std": np.std(iats) if len(iats) > 0 else 0,
-        "Fwd IAT Total": sum(iats[:len(fwd)]) if len(fwd) > 0 else 0,
-        "Fwd IAT Mean": np.mean(iats[:len(fwd)]) if len(fwd) > 0 else 0,
-        "Fwd IAT Std": np.std(iats[:len(fwd)]) if len(fwd) > 0 else 0,
-        "Bwd IAT Total": sum(iats[len(fwd):]) if len(bwd) > 0 else 0,
-        "Bwd IAT Mean": np.mean(iats[len(fwd):]) if len(bwd) > 0 else 0,
-        "Bwd IAT Std": np.std(iats[len(fwd):]) if len(bwd) > 0 else 0,
-
-        # Flags
-        "Fwd PSH Flags": f["flags"].count("P"),
-        "Bwd PSH Flags": f["flags"].count("p"),
-        "Fwd URG Flags": f["flags"].count("U"),
-        "Bwd URG Flags": f["flags"].count("u"),
-
-        # Header lengths
-        "Fwd Header Length": np.mean(f["fwd_hdr_len"]) if f["fwd_hdr_len"] else 0,
-        "Bwd Header Length": np.mean(f["bwd_hdr_len"]) if f["bwd_hdr_len"] else 0,
-
-        # Packet rates per direction - use safe duration
-        "Fwd Packets/s": len(fwd) / dur_safe,
-        "Bwd Packets/s": len(bwd) / dur_safe,
-
-        # Packet statistics
-        "Packet Length Mean": np.mean(sizes) if sizes else 0,
-        "Packet Length Std": np.std(sizes) if sizes else 0,
-        "Packet Length Variance": np.var(sizes) if sizes else 0,
-
-        # TCP flag counts
-        "FIN Flag Count": f["flags"].count("F"),
-        "SYN Flag Count": f["flags"].count("S"),
-        "RST Flag Count": f["flags"].count("R"),
-        "PSH Flag Count": f["flags"].count("P"),
-        "ACK Flag Count": f["flags"].count("A"),
-
-        # Additional flow-level features
-        "Average Packet Size": sum(sizes) / total_packets_safe,
-        "Avg Fwd Segment Size": np.mean(fwd) if fwd else 0,
-        "Avg Bwd Segment Size": np.mean(bwd) if bwd else 0,
-
-        "Fwd Header Length.1": np.mean(f["fwd_hdr_len"]) if f["fwd_hdr_len"] else 0,
-        "act_data_pkt_fwd": len([x for x in fwd if x > 0]),
-        "min_seg_size_forward": min(fwd) if fwd else 0,
-
-        # Active/Idle
-        "Active Mean": dur_safe / total_packets_safe,
-        "Active Std": np.std(iats) if len(iats) > 0 else 0,
-        "Active Max": max(iats) if len(iats) > 0 else 0,
-        "Active Min": min(iats) if len(iats) > 0 else 0,
-
-        "Idle Mean": np.mean(iats) if len(iats) > 0 else 0,
-        "Idle Std": np.std(iats) if len(iats) > 0 else 0,
-        "Idle Max": max(iats) if len(iats) > 0 else 0,
-        "Idle Min": min(iats) if len(iats) > 0 else 0
+        'final_score': round(min(MAX_Y_ALERT_SCORE, iso_score * 100.0), 2),
+        'attack_type': 'Normal',
+        'severity': 'Low'
     }
 
 
-async def process_flow_features_async(features, flow_id=None):
-    """
-    Async version of process_flow_features to run in background.
-    Now includes proper source and destination information from flow data.
-    """
-    try:
-        df = pd.DataFrame([features], columns=FEATURES)
-        logger.info("Processing flow features for prediction")
-        
-        # RF PREDICTION
-        rf_pred_raw = rf.predict(df)[0]             
-        rf_label = str(rf_pred_raw)
-        rf_prob = float(rf.predict_proba(df)[0].max())
-
-        # ISO FOREST SCORE
-        iso_score = abs(float(iso.decision_function(df)[0]))
-
-        fused = fusion_engine(rf_label, rf_prob, iso_score)
-
-        # Extract source and destination from flow_id if available
-        src_ip = "Unknown"
-        dst_ip = "Unknown"
-        protocol = "TCP"
-        sport = ""
-        dport = ""
-        
-        if flow_id and len(flow_id) >= 5:
-            src_ip = flow_id[0]  # Source IP
-            dst_ip = flow_id[1]  # Destination IP
-            sport = str(flow_id[2])   # Source port (convert to string)
-            dport = str(flow_id[3])   # Destination port (convert to string)
-            protocol = str(flow_id[4])  # Protocol (convert to string)
-
-        # Create simplified alert structure for frontend with correct src/dst
-        alert_data = {
-            "final": fused,
-            "protocol": protocol,
-            "src_ip": src_ip,
-            "dst_ip": dst_ip,
-            "sport": sport,
-            "dport": dport,
-            "timestamp": time.time(),
-            "message": f"Flow processed: {fused['attack_type']} ({fused['severity']})"
-        }
-        
-        await send_alert_async(alert_data)
-        return alert_data
-    except Exception as e:
-        logger.error(f"Error processing flow features: {e}")
-        return None
+def process_packet(packet):
+    with flows_lock:
+        _ingest_packet_locked(packet)
 
 
-async def send_alert_async(alert):
-    """
-    Async version of send_alert to avoid blocking.
-    """
-    try:
-        channel_layer = get_channel_layer()
-        logger.info("Broadcasting alert to dashboard: %s", alert)
-        await channel_layer.group_send(
-            "alerts",
-            {
-                "type": "send_alert",
-                "data": alert
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error sending alert: {e}")
+def _ingest_packet_locked(packet):
+    fid = _flow_id(packet)
+    if not fid:
+        return False
 
-
-async def process_single_flow(item):
-    """Process a single flow with error handling and timing"""
-    start_time = time.time()
-    try:
-        # Handle both old format (features) and new format (features, flow_id)
-        if isinstance(item, tuple) and len(item) == 2:
-            features, flow_id = item
-        else:
-            features = item
-            flow_id = None
-            
-        result = await process_flow_features_async(features, flow_id)
-        processing_time = time.time() - start_time
-        
-        # Update stats
-        global processing_stats
-        processing_stats["avg_processing_time"] = (
-            (processing_stats["avg_processing_time"] * (processing_stats["flows_processed"] - 1)) + processing_time
-        ) / max(processing_stats["flows_processed"], 1)
-        
-        logger.info(f"Flow processed in {processing_time:.3f}s")
-        return result
-    except Exception as e:
-        logger.error(f"Error processing single flow: {e}")
-        return None
-
-async def background_worker(worker_id):
-    """Individual worker for parallel processing"""
-    logger.info(f"Background worker {worker_id} started")
-    while True:
-        try:
-            # Get the next item from the queue (this will block until an item is available)
-            features = await processing_queue.get()
-            
-            # Process the features asynchronously
-            await process_single_flow(features)
-            
-            # Mark the task as done
-            processing_queue.task_done()
-            
-        except Exception as e:
-            logger.error(f"Error in worker {worker_id}: {e}")
-            # If there's an error, still mark the task as done to prevent queue buildup
-            if not processing_queue.empty():
-                processing_queue.task_done()
-
-async def start_background_workers(num_workers=3):
-    """Start multiple background workers for parallel processing"""
-    logger.info(f"Starting {num_workers} background workers")
-    workers = []
-    for i in range(num_workers):
-        worker = asyncio.create_task(background_worker(i + 1))
-        workers.append(worker)
-    
-    # Wait for all workers (they run indefinitely)
-    await asyncio.gather(*workers)
-
-def start_parallel_processors(num_workers=3):
-    """Start parallel processors in a separate thread"""
-    try:
-        asyncio.run(start_background_workers(num_workers))
-    except Exception as e:
-        logger.error(f"Error in parallel processors: {e}")
-
-
-def flush_flows_async():
-    """
-    Enhanced flow processing with multiple triggers:
-    1. Time-based expiration (FLOW_TIMEOUT)
-    2. Size-based processing (MIN_PACKETS_FOR_PROCESSING)
-    3. Maximum size enforcement (MAX_FLOW_SIZE)
-    """
-    global processing_stats
     now = time.time()
-    processed_flows = []
+    packet_size = max(1, int(packet.get('size') or packet.get('bytes') or 0))
 
-    for fid, f in list(flows.items()):
-        total_packets = len(f["sizes"])
-        time_since_last = now - f["last"]
-        
-        should_process = False
-        reason = ""
-        immediate_alert = False
-        
-        # Check processing triggers
-        if time_since_last > FLOW_TIMEOUT:
-            should_process = True
-            immediate_alert = True  # Timeout flows need immediate alerts
-            reason = f"timeout ({time_since_last:.1f}s)"
-        elif total_packets >= MAX_FLOW_SIZE:
-            should_process = True
-            immediate_alert = True  # Large flows need immediate alerts
-            reason = f"max_size ({total_packets})"
-        elif total_packets >= MIN_PACKETS_FOR_PROCESSING and time_since_last > 5:
-            should_process = True
-            immediate_alert = True  # Size-triggered flows need immediate alerts
-            reason = f"min_packets ({total_packets})"
-        
-        if should_process:
-            features = compute_features(f)
-            if immediate_alert:
-                # Process immediately for alert generation with flow_id
-                try:
-                    asyncio.run(process_flow_features_async(features, fid))
-                    logger.info(f"IMMEDIATE processing flow {fid} due to {reason} - {total_packets} packets")
-                except Exception as e:
-                    logger.error(f"Error in immediate processing: {e}")
-                    # Fallback to background processing
-                    processing_queue.put_nowait((features, fid))
-            else:
-                # Queue for background processing with flow_id
-                processing_queue.put_nowait((features, fid))
-                logger.info(f"Background processing flow {fid} due to {reason} - {total_packets} packets")
-            
-            processed_flows.append(fid)
+    flow = flows.get(fid)
+    if flow is None:
+        flow = {
+            'timestamps': [],
+            'sizes': [],
+            'fwd_sizes': [],
+            'bwd_sizes': [],
+            'flags': [],
+            'fwd_hdr_len': [],
+            'bwd_hdr_len': [],
+            'src': fid[0],
+            'first': now,
+            'last': now
+        }
+        flows[fid] = flow
 
-    # Remove processed flows
-    for fid in processed_flows:
-        del flows[fid]
-        processing_stats["flows_processed"] += 1
-        processing_stats["packets_processed"] += len(flows.get(fid, {}).get("sizes", []))
+    flow['timestamps'].append(now)
+    flow['sizes'].append(packet_size)
+
+    if fid[0] == flow['src']:
+        flow['fwd_sizes'].append(packet_size)
+    else:
+        flow['bwd_sizes'].append(packet_size)
+
+    flow['last'] = now
+    return True
+
+
+def _compute_features(flow):
+    timestamps = flow['timestamps']
+    sizes = flow['sizes']
+    fwd_sizes = flow['fwd_sizes']
+    bwd_sizes = flow['bwd_sizes']
+
+    duration = (timestamps[-1] - timestamps[0]) if len(timestamps) > 1 else 0.001
+    duration_safe = max(duration, 0.001)
+
+    iats = np.diff(np.array(timestamps, dtype=float)) if len(timestamps) > 1 else np.array([0.0], dtype=float)
+    packet_count = max(len(sizes), 1)
+
+    fwd_iats = iats[:len(fwd_sizes)] if len(fwd_sizes) else np.array([0.0])
+    bwd_iats = iats[len(fwd_sizes):] if len(bwd_sizes) else np.array([0.0])
+
+    return {
+        'Flow Duration': duration,
+        'Total Fwd Packets': len(fwd_sizes),
+        'Total Backward Packets': len(bwd_sizes),
+        'Total Length of Fwd Packets': float(sum(fwd_sizes)),
+        'Total Length of Bwd Packets': float(sum(bwd_sizes)),
+        'Fwd Packet Length Mean': _safe_float(np.mean(fwd_sizes)) if fwd_sizes else 0.0,
+        'Bwd Packet Length Mean': _safe_float(np.mean(bwd_sizes)) if bwd_sizes else 0.0,
+        'Flow Bytes/s': _safe_float(sum(sizes) / duration_safe),
+        'Flow Packets/s': _safe_float(len(sizes) / duration_safe),
+        'Flow IAT Mean': _safe_float(np.mean(iats)),
+        'Flow IAT Std': _safe_float(np.std(iats)),
+        'Fwd IAT Total': _safe_float(np.sum(fwd_iats)),
+        'Fwd IAT Mean': _safe_float(np.mean(fwd_iats)),
+        'Fwd IAT Std': _safe_float(np.std(fwd_iats)),
+        'Bwd IAT Total': _safe_float(np.sum(bwd_iats)),
+        'Bwd IAT Mean': _safe_float(np.mean(bwd_iats)),
+        'Bwd IAT Std': _safe_float(np.std(bwd_iats)),
+        'Fwd PSH Flags': 0.0,
+        'Bwd PSH Flags': 0.0,
+        'Fwd URG Flags': 0.0,
+        'Bwd URG Flags': 0.0,
+        'Fwd Header Length': 0.0,
+        'Bwd Header Length': 0.0,
+        'Fwd Packets/s': _safe_float(len(fwd_sizes) / duration_safe),
+        'Bwd Packets/s': _safe_float(len(bwd_sizes) / duration_safe),
+        'Packet Length Mean': _safe_float(np.mean(sizes)),
+        'Packet Length Std': _safe_float(np.std(sizes)),
+        'Packet Length Variance': _safe_float(np.var(sizes)),
+        'FIN Flag Count': 0.0,
+        'SYN Flag Count': 0.0,
+        'RST Flag Count': 0.0,
+        'PSH Flag Count': 0.0,
+        'ACK Flag Count': 0.0,
+        'Average Packet Size': _safe_float(sum(sizes) / packet_count),
+        'Avg Fwd Segment Size': _safe_float(np.mean(fwd_sizes)) if fwd_sizes else 0.0,
+        'Avg Bwd Segment Size': _safe_float(np.mean(bwd_sizes)) if bwd_sizes else 0.0,
+        'Fwd Header Length.1': 0.0,
+        'act_data_pkt_fwd': float(len([value for value in fwd_sizes if value > 0])),
+        'min_seg_size_forward': float(min(fwd_sizes) if fwd_sizes else 0.0),
+        'Active Mean': _safe_float(duration_safe / packet_count),
+        'Active Std': _safe_float(np.std(iats)),
+        'Active Max': _safe_float(np.max(iats)),
+        'Active Min': _safe_float(np.min(iats)),
+        'Idle Mean': _safe_float(np.mean(iats)),
+        'Idle Std': _safe_float(np.std(iats)),
+        'Idle Max': _safe_float(np.max(iats)),
+        'Idle Min': _safe_float(np.min(iats))
+    }
+
+
+def _prepare_model_row(feature_map):
+    row = {}
+    for feature in FEATURES:
+        trimmed = feature.strip()
+        row[feature] = _safe_float(feature_map.get(feature, feature_map.get(trimmed, 0.0)))
+    return row
+
+
+def _predict_alerts(flow_items):
+    if not flow_items:
+        return []
+
+    start = time.time()
+
+    feature_rows = []
+    for _, flow in flow_items:
+        feature_rows.append(_prepare_model_row(_compute_features(flow)))
+
+    frame = pd.DataFrame(feature_rows, columns=FEATURES).fillna(0.0)
+
+    rf_pred = rf.predict(frame)
+    if hasattr(rf, 'predict_proba'):
+        rf_prob = rf.predict_proba(frame).max(axis=1)
+    else:
+        rf_prob = np.ones(len(flow_items), dtype=float)
+
+    iso_scores = np.abs(iso.decision_function(frame))
+
+    alerts = []
+    for index, (fid, _) in enumerate(flow_items):
+        fused = fusion_engine(str(rf_pred[index]), float(rf_prob[index]), float(iso_scores[index]))
+
+        alert = {
+            'final': fused,
+            'protocol': _protocol_label(fid[4]),
+            'src_ip': fid[0],
+            'dst_ip': fid[1],
+            'sport': fid[2],
+            'dport': fid[3],
+            'timestamp': time.time(),
+            'message': f"Flow processed: {fused['attack_type']} ({fused['severity']})"
+        }
+        alerts.append(alert)
+
+    elapsed_ms = (time.time() - start) * 1000.0
+    flows_count = len(flow_items)
+
+    if flows_count:
+        previous_total = processing_stats['flows_processed']
+        new_total = previous_total + flows_count
+        processing_stats['avg_processing_time_ms'] = (
+            (processing_stats['avg_processing_time_ms'] * previous_total) + elapsed_ms
+        ) / max(new_total, 1)
+
+    return alerts
+
+
+def _select_ready_flows(force=False):
+    now = time.time()
+    ready = []
+
+    with flows_lock:
+        for fid, flow in list(flows.items()):
+            packet_count = len(flow['sizes'])
+            flow_age = now - flow['first']
+            idle_age = now - flow['last']
+
+            should_process = (
+                force
+                or packet_count >= MAX_FLOW_PACKETS
+                or idle_age >= FLOW_TIMEOUT
+                or (packet_count >= MIN_PACKETS_FOR_PROCESSING and flow_age >= ACTIVE_FLOW_FLUSH_INTERVAL)
+            )
+
+            if should_process:
+                ready.append((fid, flow))
+                del flows[fid]
+
+    return ready
+
+
+def flush_flows_async(force=False):
+    ready_flows = _select_ready_flows(force=force)
+    alerts = _predict_alerts(ready_flows)
+
+    if alerts:
+        async_to_sync(send_alert_batch_async)(alerts)
+
+    processing_stats['flows_processed'] += len(ready_flows)
+    processing_stats['alerts_emitted'] += len(alerts)
+    return len(alerts)
+
+
+def process_packet_batch(packets, force_flush=False):
+    valid_packets = [packet for packet in packets if isinstance(packet, dict)]
+
+    ingested_count = 0
+    with flows_lock:
+        for packet in valid_packets:
+            if _ingest_packet_locked(packet):
+                ingested_count += 1
+
+    processing_stats['packets_processed'] += ingested_count
+    ready_flows = _select_ready_flows(force=force_flush)
+    alerts = _predict_alerts(ready_flows)
+
+    if alerts:
+        async_to_sync(send_alert_batch_async)(alerts)
+
+    processing_stats['flows_processed'] += len(ready_flows)
+    processing_stats['alerts_emitted'] += len(alerts)
+    return alerts
+
 
 def get_processing_stats():
-    """Return current processing statistics"""
-    global processing_stats
-    uptime = time.time() - processing_stats["start_time"]
+    uptime = time.time() - processing_stats['start_time']
+    with flows_lock:
+        in_memory_flows = len(flows)
+
+    flows_processed = max(processing_stats['flows_processed'], 1)
     return {
-        "flows_processed": processing_stats["flows_processed"],
-        "packets_processed": processing_stats["packets_processed"],
-        "avg_packets_per_flow": processing_stats["packets_processed"] / max(processing_stats["flows_processed"], 1),
-        "queue_depth": processing_queue.qsize(),
-        "uptime_seconds": uptime,
-        "flows_in_memory": len(flows),
-        "processing_rate_flows_per_sec": processing_stats["flows_processed"] / max(uptime, 1),
-        "processing_rate_packets_per_sec": processing_stats["packets_processed"] / max(uptime, 1)
+        'flows_processed': processing_stats['flows_processed'],
+        'packets_processed': processing_stats['packets_processed'],
+        'alerts_emitted': processing_stats['alerts_emitted'],
+        'avg_packets_per_flow': processing_stats['packets_processed'] / flows_processed,
+        'avg_processing_time_ms': processing_stats['avg_processing_time_ms'],
+        'queue_depth': 0,
+        'uptime_seconds': uptime,
+        'flows_in_memory': in_memory_flows,
+        'processing_rate_flows_per_sec': processing_stats['flows_processed'] / max(uptime, 1.0),
+        'processing_rate_packets_per_sec': processing_stats['packets_processed'] / max(uptime, 1.0)
     }
-
-
-def process_flow_features_sync(features):
-    """
-    Synchronous wrapper for backward compatibility.
-    This will be used for immediate processing when needed.
-    """
-    return asyncio.run(process_flow_features_async(features))
-
-
-def flush_flows():
-    now = time.time()
-
-    expired = []
-
-    for fid,f in flows.items():
-
-        if now - f["last"] > FLOW_TIMEOUT:
-
-            features = compute_features(f)
-            process_flow_features(features)
-            expired.append(fid)
-
-    for fid in expired:
-        del flows[fid]
 
 
 async def send_packet_batch_async(packets):
-
-    print("Broadcasting batch of", len(packets), "packets to dashboard")
-
     channel_layer = get_channel_layer()
-
     await channel_layer.group_send(
-        "network_traffic",
+        'network_traffic',
         {
-            "type": "send_traffic",
-            "data": packets
+            'type': 'send_traffic',
+            'data': packets
         }
     )
+
 
 async def send_alert_async(alert):
-
     channel_layer = get_channel_layer()
-    print("Broadcasting alert to dashboard:", alert)
-
-def send_alert(alert):
-
-    channel_layer = get_channel_layer()
-    print("Broadcasting alert to dashboard:", alert)
-    async_to_sync(channel_layer.group_send)(
-        "alerts",
+    await channel_layer.group_send(
+        'alerts',
         {
-            "type":"send_alert",
-            "data":alert
+            'type': 'send_alert',
+            'data': alert
         }
     )
+
+
+async def send_alert_batch_async(alerts):
+    for alert in alerts:
+        await send_alert_async(alert)
+
+
+def send_alert(alert):
+    async_to_sync(send_alert_async)(alert)
+
+
+def start_parallel_processors(num_workers=3):
+    # Retained for backward compatibility with existing management command.
+    logger.info('Inline batch processor active. Separate workers are not required (requested: %s).', num_workers)
 
 
 @csrf_exempt
 def predict_flow(request):
-    """
-    HTTP endpoint to receive packet batches and process them asynchronously.
-    This endpoint now returns immediately to prevent timeouts.
-    """
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Only POST is supported'}, status=405)
+
     try:
-        data = json.loads(request.body)
-        packets = data["packets"]
-        
-        logger.info(f"Received {len(packets)} packets for processing")
-        
-        # 1️⃣ broadcast packets to dashboard (synchronous but fast)
-        asyncio.run(send_packet_batch_async(packets))
-        
-        # 2️⃣ update flow engine (synchronous but fast)
-        for pkt in packets:
-            process_packet(pkt)
-        
-        # 3️⃣ queue flow processing for background (non-blocking)
-        flush_flows_async()
-        
-        # Return immediately to prevent timeout
-        return JsonResponse({
-            "status": "ok",
-            "message": "Packets received and queued for processing",
-            "packet_count": len(packets)
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in predict_flow: {e}")
-        return JsonResponse({
-            "status": "error",
-            "message": str(e)
-        }, status=500)
+        body = json.loads(request.body)
+        packets = body.get('packets', [])
+
+        if not isinstance(packets, list):
+            return JsonResponse({'status': 'error', 'message': 'packets must be a list'}, status=400)
+
+        async_to_sync(send_packet_batch_async)(packets)
+        alerts = process_packet_batch(packets, force_flush=False)
+
+        return JsonResponse(
+            {
+                'status': 'ok',
+                'message': 'Packets processed',
+                'packet_count': len(packets),
+                'alerts_emitted': len(alerts)
+            }
+        )
+    except json.JSONDecodeError:
+        return JsonResponse({'status': 'error', 'message': 'Invalid JSON body'}, status=400)
+    except Exception as error:
+        logger.exception('Error in predict_flow')
+        return JsonResponse({'status': 'error', 'message': str(error)}, status=500)

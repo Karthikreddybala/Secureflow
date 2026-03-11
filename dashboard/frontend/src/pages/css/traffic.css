@@ -165,12 +165,14 @@
   border-radius: 10px;
   min-height: 0;
   flex: 1;
+  max-height: calc(100vh - 340px);
 }
 
 .live-traffic-table {
   margin-bottom: 0;
   color: #d8ebff;
   font-size: 0.82rem;
+  min-width: 960px;
 }
 
 .live-traffic-table thead th {
@@ -325,6 +327,10 @@
   .traffic-side {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     grid-template-rows: auto;
+  }
+
+  .live-table-scroll {
+    max-height: 58vh;
   }
 }
 

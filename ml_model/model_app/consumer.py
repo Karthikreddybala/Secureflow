@@ -1,7 +1,8 @@
 import json
 from channels.generic.websocket import AsyncWebsocketConsumer
+from asgiref.sync import sync_to_async
 
-from .views import flush_flows_async, process_packet
+from .views import process_packet_batch
 
 class AlertConsumer(AsyncWebsocketConsumer):
 
@@ -86,14 +87,8 @@ class PacketConsumer(AsyncWebsocketConsumer):
                 }
             )
 
-            # Process packets for ML analysis (sync to async)
-            for pkt in packets:
-                # Convert async function call to sync for compatibility
-                from asgiref.sync import sync_to_async
-                await sync_to_async(process_packet)(pkt)
-
-            # Trigger flow processing
-            await sync_to_async(flush_flows_async)()
+            # Process packet batch in one call to reduce per-packet async overhead.
+            await sync_to_async(process_packet_batch)(packets, False)
             
         except json.JSONDecodeError as e:
             print(f"JSON decode error: {e}")

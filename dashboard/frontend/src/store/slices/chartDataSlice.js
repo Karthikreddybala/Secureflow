@@ -1,5 +1,8 @@
 import { createSlice } from '@reduxjs/toolkit'
 
+const MAX_CHART_POINTS = 240
+const MAX_Y_VALUE = 100
+
 const initialState = {
   networkTrafficData: {
     labels: [],
@@ -34,13 +37,15 @@ export const chartDataSlice = createSlice({
     updateNetworkTrafficData: (state, action) => {
       const now = new Date()
       const timeLabel = now.toLocaleTimeString()
+      const count = Number(action.payload.count || 0)
+      const clampedCount = Math.max(0, Math.min(MAX_Y_VALUE, count))
       
       // Add new data point
       state.networkTrafficData.labels.push(timeLabel)
-      state.networkTrafficData.datasets[0].data.push(action.payload.count || 0)
+      state.networkTrafficData.datasets[0].data.push(clampedCount)
       
-      // Keep only last 20 data points for performance
-      if (state.networkTrafficData.labels.length > 20) {
+      // Keep bounded history to avoid memory growth
+      if (state.networkTrafficData.labels.length > MAX_CHART_POINTS) {
         state.networkTrafficData.labels.shift()
         state.networkTrafficData.datasets[0].data.shift()
       }
@@ -64,6 +69,23 @@ export const chartDataSlice = createSlice({
       
       state.lastChartDataUpdate = Date.now()
     },
+    updateProtocolDistributionBatch: (state, action) => {
+      const protocolCounts = action.payload || {}
+
+      Object.entries(protocolCounts).forEach(([protocol, count]) => {
+        const protocolIndex = state.protocolDistribution.labels.indexOf(protocol)
+        const targetIndex =
+          protocolIndex !== -1
+            ? protocolIndex
+            : state.protocolDistribution.labels.indexOf('Other')
+
+        if (targetIndex !== -1) {
+          state.protocolDistribution.datasets[0].data[targetIndex] += Number(count || 0)
+        }
+      })
+
+      state.lastChartDataUpdate = Date.now()
+    },
     resetChartData: (state) => {
       state.networkTrafficData = initialState.networkTrafficData
       state.protocolDistribution = initialState.protocolDistribution
@@ -78,6 +100,7 @@ export const chartDataSlice = createSlice({
 export const { 
   updateNetworkTrafficData, 
   updateProtocolDistribution, 
+  updateProtocolDistributionBatch,
   resetChartData,
   clearProtocolData
 } = chartDataSlice.actions

@@ -1,158 +1,132 @@
-// Chart Data Manager - maintains chart data across component navigation
+const HISTORY_LIMIT = 240
+const MAX_Y_VALUE = 100
+
+const createNetworkTrafficTemplate = () => ({
+    labels: [],
+    datasets: [
+        {
+            label: 'Network Packets',
+            data: [],
+            borderColor: 'rgb(54, 162, 235)',
+            backgroundColor: 'rgba(54, 162, 235, 0.08)',
+            borderWidth: 2,
+            fill: false,
+            tension: 0,
+            pointRadius: 0,
+            pointHoverRadius: 4
+        },
+        {
+            label: 'Security Alerts',
+            data: [],
+            borderColor: 'rgb(255, 99, 132)',
+            backgroundColor: 'rgba(255, 99, 132, 0.08)',
+            borderWidth: 2,
+            fill: false,
+            tension: 0,
+            pointRadius: 0,
+            pointHoverRadius: 4
+        }
+    ]
+})
+
+const normalizeProtocol = (protocolValue) => {
+    const protocol = String(protocolValue ?? '').toUpperCase()
+    if (protocol === '6' || protocol === 'TCP') return 'TCP'
+    if (protocol === '17' || protocol === 'UDP') return 'UDP'
+    if (protocol === '1' || protocol === 'ICMP') return 'ICMP'
+    return 'Other'
+}
+
+const clampY = (value) => Math.max(0, Math.min(MAX_Y_VALUE, Number(value || 0)))
+
 class ChartDataManager {
     constructor() {
         if (ChartDataManager.instance) {
-            return ChartDataManager.instance;
+            return ChartDataManager.instance
         }
-        
-        this.networkTrafficData = {
-            labels: [],
-            datasets: [
-                {
-                    label: 'Network Packets',
-                    data: [],
-                    borderColor: 'rgb(54, 162, 235)',
-                    backgroundColor: 'rgba(54, 162, 235, 0.1)',
-                    borderWidth: 2,
-                    fill: true,
-                    tension: 0.4,
-                    pointRadius: 3,
-                    pointHoverRadius: 6
-                },
-                {
-                    label: 'Security Alerts',
-                    data: [],
-                    borderColor: 'rgb(255, 99, 132)',
-                    backgroundColor: 'rgba(255, 99, 132, 0.1)',
-                    borderWidth: 2,
-                    fill: true,
-                    tension: 0.4,
-                    pointRadius: 3,
-                    pointHoverRadius: 6
-                }
-            ]
-        };
 
+        this.networkTrafficData = createNetworkTrafficTemplate()
         this.protocolData = {
             TCP: 0,
             UDP: 0,
             ICMP: 0,
             Other: 0
-        };
-
+        }
         this.attackData = {
             normal: 0,
             attacks: 0,
             total: 0
-        };
+        }
+        this.totalCount = 0
 
-        this.totalCount = 0;
-
-        ChartDataManager.instance = this;
-        return this;
+        ChartDataManager.instance = this
+        return this
     }
 
-    // Update network traffic chart data
     updateNetworkTraffic(data, isAlert = false) {
-        const now = new Date();
-        const timeLabel = now.toLocaleTimeString();
-        const value = isAlert ? 1 : (Array.isArray(data) ? data.length : 1);
+        const timeLabel = new Date().toLocaleTimeString()
+        const value = isAlert ? 1 : (Array.isArray(data) ? data.length : 1)
+        const boundedValue = clampY(value)
 
-        // Update labels and data
-        this.networkTrafficData.labels.push(timeLabel);
-        this.networkTrafficData.datasets[0].data.push(isAlert ? 0 : value);
-        this.networkTrafficData.datasets[1].data.push(isAlert ? value : 0);
+        this.networkTrafficData.labels.push(timeLabel)
+        this.networkTrafficData.datasets[0].data.push(isAlert ? 0 : boundedValue)
+        this.networkTrafficData.datasets[1].data.push(isAlert ? boundedValue : 0)
 
-        // Keep only last 20 data points for performance
-        if (this.networkTrafficData.labels.length > 20) {
-            this.networkTrafficData.labels.shift();
-            this.networkTrafficData.datasets[0].data.shift();
-            this.networkTrafficData.datasets[1].data.shift();
+        if (this.networkTrafficData.labels.length > HISTORY_LIMIT) {
+            this.networkTrafficData.labels.shift()
+            this.networkTrafficData.datasets[0].data.shift()
+            this.networkTrafficData.datasets[1].data.shift()
         }
     }
 
-    // Update protocol pie chart data
     updateProtocolData(data) {
-        // Handle batch data
-        const packets = Array.isArray(data) ? data : [data];
-        
-        packets.forEach(packet => {
-            const proto = packet.proto || packet.protocol || packet.proto || "Unknown";
-            if (proto === 6 || proto === "6" || proto === "TCP") {
-                this.protocolData.TCP++;
-            } else if (proto === 17 || proto === "17" || proto === "UDP") {
-                this.protocolData.UDP++;
-            } else if (proto === 1 || proto === "1" || proto === "ICMP") {
-                this.protocolData.ICMP++;
-            } else {
-                this.protocolData.Other++;
-            }
-        });
+        const packets = Array.isArray(data) ? data : [data]
 
-        this.totalCount += packets.length;
+        packets.forEach((packet) => {
+            const protocol = normalizeProtocol(packet?.proto ?? packet?.protocol)
+            this.protocolData[protocol] += 1
+        })
+
+        this.totalCount += packets.length
     }
 
-    // Update protocol data from alerts
     updateProtocolFromAlert(alertData) {
-        if (alertData && alertData.protocol) {
-            const proto = alertData.protocol;
-            if (proto === 6 || proto === "6" || proto === "TCP") {
-                this.protocolData.TCP++;
-            } else if (proto === 17 || proto === "17" || proto === "UDP") {
-                this.protocolData.UDP++;
-            } else if (proto === 1 || proto === "1" || proto === "ICMP") {
-                this.protocolData.ICMP++;
-            } else {
-                this.protocolData.Other++;
-            }
-            this.totalCount++;
-        }
+        const protocol = normalizeProtocol(alertData?.protocol)
+        this.protocolData[protocol] += 1
+        this.totalCount += 1
     }
 
-    // Update attack distribution data
     updateAttackData(isAttack = false) {
         if (isAttack) {
-            this.attackData.attacks++;
+            this.attackData.attacks += 1
         } else {
-            this.attackData.normal++;
+            this.attackData.normal += 1
         }
-        this.attackData.total++;
+        this.attackData.total += 1
     }
 
-    // Get current attack data
     getAttackData() {
-        return {
-            ...this.attackData
-        };
+        return { ...this.attackData }
     }
 
-    // Get current network traffic data
     getNetworkTrafficData() {
-        return JSON.parse(JSON.stringify(this.networkTrafficData));
+        return JSON.parse(JSON.stringify(this.networkTrafficData))
     }
 
-    // Get current protocol data
     getProtocolData() {
         return {
             ...this.protocolData,
             totalCount: this.totalCount
-        };
+        }
     }
 
-    // Reset data (optional)
     reset() {
-        this.networkTrafficData.labels = [];
-        this.networkTrafficData.datasets[0].data = [];
-        this.networkTrafficData.datasets[1].data = [];
-        this.protocolData.TCP = 0;
-        this.protocolData.UDP = 0;
-        this.protocolData.ICMP = 0;
-        this.protocolData.Other = 0;
-        this.totalCount = 0;
+        this.networkTrafficData = createNetworkTrafficTemplate()
+        this.protocolData = { TCP: 0, UDP: 0, ICMP: 0, Other: 0 }
+        this.attackData = { normal: 0, attacks: 0, total: 0 }
+        this.totalCount = 0
     }
 }
 
-// Create singleton instance
-const chartDataManager = new ChartDataManager();
-
-export default chartDataManager;
+const chartDataManager = new ChartDataManager()
+export default chartDataManager

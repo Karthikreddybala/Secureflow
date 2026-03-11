@@ -76,7 +76,7 @@ function LiveTrafficTable({ data, isPaused }) {
       </div>
 
       <div className="live-table-scroll">
-        <Table className="live-traffic-table" hover responsive>
+        <Table className="live-traffic-table" hover>
           <thead>
             <tr>
               <th>Time</th>

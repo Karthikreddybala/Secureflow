@@ -1,193 +1,228 @@
-const WEBSOCKET_URL = "ws://localhost:8000/ws/alerts/"
-const NETWORK_WEBSOCKET_URL = "ws://localhost:8000/ws/network/"
-const RECONNECT_INTERVAL = 3000
+const RECONNECT_BASE_MS = 3000
 const MAX_RECONNECT_ATTEMPTS = 10
+
+const resolveBaseSocketUrl = () => {
+  const envBase = import.meta?.env?.VITE_WS_BASE_URL
+  if (envBase) {
+    return envBase.replace(/\/$/, '')
+  }
+
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  const host = window.location.hostname || '127.0.0.1'
+  return `${protocol}://${host}:8000`
+}
+
+const ALERTS_URL = `${resolveBaseSocketUrl()}/ws/alerts/`
+const NETWORK_URL = `${resolveBaseSocketUrl()}/ws/network/`
 
 class WebSocketManager {
   constructor() {
     this.alertSocket = null
     this.networkSocket = null
+
     this.alertReconnectAttempts = 0
     this.networkReconnectAttempts = 0
+
+    this.alertReconnectTimer = null
+    this.networkReconnectTimer = null
+
     this.isAlertConnected = false
     this.isNetworkConnected = false
-    this.alertMessageHandlers = []
-    this.networkMessageHandlers = []
-    this.connectionStatusHandlers = [] // New: handlers for connection status changes
+
+    this.alertMessageHandlers = new Set()
+    this.networkMessageHandlers = new Set()
+    this.connectionStatusHandlers = new Set()
+
+    this.isManuallyClosed = false
+  }
+
+  connect() {
+    this.isManuallyClosed = false
     this.connectAlerts()
     this.connectNetwork()
   }
 
-  // Add connection status handler
-  addConnectionStatusHandler(handler) {
-    this.connectionStatusHandlers.push(handler)
+  disconnect() {
+    this.isManuallyClosed = true
+    this.clearReconnectTimers()
+
+    if (this.alertSocket) {
+      this.alertSocket.close(1000, 'Client disconnect')
+      this.alertSocket = null
+    }
+
+    if (this.networkSocket) {
+      this.networkSocket.close(1000, 'Client disconnect')
+      this.networkSocket = null
+    }
+
+    this.isAlertConnected = false
+    this.isNetworkConnected = false
+    this.notifyConnectionStatus()
   }
 
-  // Remove connection status handler
-  removeConnectionStatusHandler(handler) {
-    this.connectionStatusHandlers = this.connectionStatusHandlers.filter(h => h !== handler)
+  clearReconnectTimers() {
+    if (this.alertReconnectTimer) {
+      clearTimeout(this.alertReconnectTimer)
+      this.alertReconnectTimer = null
+    }
+
+    if (this.networkReconnectTimer) {
+      clearTimeout(this.networkReconnectTimer)
+      this.networkReconnectTimer = null
+    }
   }
 
-  // Notify connection status changes
   notifyConnectionStatus() {
-    this.connectionStatusHandlers.forEach(handler => handler({
+    const payload = {
       isAlertConnected: this.isAlertConnected,
       isNetworkConnected: this.isNetworkConnected
-    }))
+    }
+
+    this.connectionStatusHandlers.forEach((handler) => {
+      try {
+        handler(payload)
+      } catch (error) {
+        console.error('Connection status handler failed:', error)
+      }
+    })
   }
 
   connectAlerts() {
+    if (
+      this.alertSocket &&
+      (this.alertSocket.readyState === WebSocket.OPEN || this.alertSocket.readyState === WebSocket.CONNECTING)
+    ) {
+      return
+    }
+
     try {
-      this.alertSocket = new WebSocket(WEBSOCKET_URL)
-      
+      this.alertSocket = new WebSocket(ALERTS_URL)
+
       this.alertSocket.onopen = () => {
-        console.log("Alert WebSocket Connected")
         this.isAlertConnected = true
         this.alertReconnectAttempts = 0
-        this.notifyAlertConnectionStatus(true)
-        this.notifyConnectionStatus() // Notify status change
+        this.notifyConnectionStatus()
       }
 
       this.alertSocket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
-          this.alertMessageHandlers.forEach(handler => handler(data))
+          this.alertMessageHandlers.forEach((handler) => handler(data))
         } catch (error) {
-          console.error("Error parsing Alert WebSocket message:", error)
+          console.error('Error parsing alert message:', error)
         }
       }
 
       this.alertSocket.onerror = (error) => {
-        console.error("Alert WebSocket Error:", error)
-        this.notifyAlertConnectionStatus(false)
-        // Additional error logging for debugging
-        console.error("Alert WebSocket error details:", {
-          type: error.type,
-          message: error.message,
-          target: error.target ? {
-            readyState: error.target.readyState,
-            url: error.target.url
-          } : null
-        })
+        console.error('Alert WebSocket error:', error)
       }
 
       this.alertSocket.onclose = (event) => {
-        console.log("Alert WebSocket Closed:", event.code, event.reason)
         this.isAlertConnected = false
-        this.notifyAlertConnectionStatus(false)
-        
-        // Attempt to reconnect if not manually closed
-        if (event.code !== 1000 && this.alertReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-          this.alertReconnectAttempts++
-          console.log(`Attempting to reconnect alerts (${this.alertReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`)
-          setTimeout(() => this.connectAlerts(), RECONNECT_INTERVAL * this.alertReconnectAttempts)
+        this.notifyConnectionStatus()
+
+        if (this.isManuallyClosed || event.code === 1000) {
+          return
         }
+
+        if (this.alertReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+          return
+        }
+
+        this.alertReconnectAttempts += 1
+        const retryDelay = RECONNECT_BASE_MS * this.alertReconnectAttempts
+        this.alertReconnectTimer = setTimeout(() => this.connectAlerts(), retryDelay)
       }
     } catch (error) {
-      console.error("Failed to create Alert WebSocket connection:", error)
+      console.error('Failed to open alerts socket:', error)
     }
   }
 
   connectNetwork() {
+    if (
+      this.networkSocket &&
+      (this.networkSocket.readyState === WebSocket.OPEN || this.networkSocket.readyState === WebSocket.CONNECTING)
+    ) {
+      return
+    }
+
     try {
-      this.networkSocket = new WebSocket(NETWORK_WEBSOCKET_URL)
-      
+      this.networkSocket = new WebSocket(NETWORK_URL)
+
       this.networkSocket.onopen = () => {
-        console.log("Network WebSocket Connected")
         this.isNetworkConnected = true
         this.networkReconnectAttempts = 0
-        this.notifyNetworkConnectionStatus(true)
-        this.notifyConnectionStatus() // Notify status change
+        this.notifyConnectionStatus()
       }
 
       this.networkSocket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
-          this.networkMessageHandlers.forEach(handler => handler(data))
+          this.networkMessageHandlers.forEach((handler) => handler(data))
         } catch (error) {
-          console.error("Error parsing Network WebSocket message:", error)
+          console.error('Error parsing network message:', error)
         }
       }
 
       this.networkSocket.onerror = (error) => {
-        console.error("Network WebSocket Error:", error)
-        this.notifyNetworkConnectionStatus(false)
-        // Additional error logging for debugging
-        console.error("Network WebSocket error details:", {
-          type: error.type,
-          message: error.message,
-          target: error.target ? {
-            readyState: error.target.readyState,
-            url: error.target.url
-          } : null
-        })
+        console.error('Network WebSocket error:', error)
       }
 
       this.networkSocket.onclose = (event) => {
-        console.log("Network WebSocket Closed:", event.code, event.reason)
         this.isNetworkConnected = false
-        this.notifyNetworkConnectionStatus(false)
-        
-        // Attempt to reconnect if not manually closed
-        if (event.code !== 1000 && this.networkReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-          this.networkReconnectAttempts++
-          console.log(`Attempting to reconnect network (${this.networkReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`)
-          setTimeout(() => this.connectNetwork(), RECONNECT_INTERVAL * this.networkReconnectAttempts)
+        this.notifyConnectionStatus()
+
+        if (this.isManuallyClosed || event.code === 1000) {
+          return
         }
+
+        if (this.networkReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+          return
+        }
+
+        this.networkReconnectAttempts += 1
+        const retryDelay = RECONNECT_BASE_MS * this.networkReconnectAttempts
+        this.networkReconnectTimer = setTimeout(() => this.connectNetwork(), retryDelay)
       }
     } catch (error) {
-      console.error("Failed to create Network WebSocket connection:", error)
+      console.error('Failed to open network socket:', error)
     }
   }
 
   addAlertMessageHandler(handler) {
-    this.alertMessageHandlers.push(handler)
+    this.alertMessageHandlers.add(handler)
   }
 
   removeAlertMessageHandler(handler) {
-    this.alertMessageHandlers = this.alertMessageHandlers.filter(h => h !== handler)
+    this.alertMessageHandlers.delete(handler)
   }
 
   addNetworkMessageHandler(handler) {
-    this.networkMessageHandlers.push(handler)
+    this.networkMessageHandlers.add(handler)
   }
 
   removeNetworkMessageHandler(handler) {
-    this.networkMessageHandlers = this.networkMessageHandlers.filter(h => h !== handler)
+    this.networkMessageHandlers.delete(handler)
   }
 
-  notifyAlertConnectionStatus(connected) {
-    // You can add UI notification logic here
-    console.log(`Alert WebSocket connection status: ${connected ? 'Connected' : 'Disconnected'}`)
+  addConnectionStatusHandler(handler) {
+    this.connectionStatusHandlers.add(handler)
   }
 
-  notifyNetworkConnectionStatus(connected) {
-    // You can add UI notification logic here
-    console.log(`Network WebSocket connection status: ${connected ? 'Connected' : 'Disconnected'}`)
-  }
-
-  close() {
-    if (this.alertSocket) {
-      this.alertSocket.close(1000, "Client disconnect")
-    }
-    if (this.networkSocket) {
-      this.networkSocket.close(1000, "Client disconnect")
-    }
+  removeConnectionStatusHandler(handler) {
+    this.connectionStatusHandlers.delete(handler)
   }
 
   sendAlert(data) {
-    if (this.alertSocket && this.isAlertConnected) {
+    if (this.alertSocket && this.alertSocket.readyState === WebSocket.OPEN) {
       this.alertSocket.send(JSON.stringify(data))
-    } else {
-      console.warn("Alert WebSocket not connected, cannot send message")
     }
   }
 
   sendNetwork(data) {
-    if (this.networkSocket && this.isNetworkConnected) {
+    if (this.networkSocket && this.networkSocket.readyState === WebSocket.OPEN) {
       this.networkSocket.send(JSON.stringify(data))
-    } else {
-      console.warn("Network WebSocket not connected, cannot send message")
     }
   }
 }

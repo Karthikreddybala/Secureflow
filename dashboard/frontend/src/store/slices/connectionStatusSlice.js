@@ -15,7 +15,7 @@ export const connectionStatusSlice = createSlice({
     setAlertConnected: (state, action) => {
       state.isAlertConnected = action.payload
       state.lastConnectionAttempt = Date.now()
-      if (action.payload) {
+      if (action.payload || state.isNetworkConnected) {
         state.connectionStatus = 'connected'
         state.connectionError = null
       } else {
@@ -25,7 +25,7 @@ export const connectionStatusSlice = createSlice({
     setNetworkConnected: (state, action) => {
       state.isNetworkConnected = action.payload
       state.lastConnectionAttempt = Date.now()
-      if (action.payload) {
+      if (action.payload || state.isAlertConnected) {
         state.connectionStatus = 'connected'
         state.connectionError = null
       } else {
