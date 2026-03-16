@@ -5,8 +5,9 @@ import time
 import logging
 import queue
 from scapy.all import sniff, PcapReader
-from scapy.all import sniff
+from scapy.all import IP, TCP, UDP
 import sys
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -163,23 +164,43 @@ class PacketProcessor:
         }
 
     def add_packet(self, pkt):
-        """Add packet to batch with error handling"""
+        """Extract rich packet fields from Scapy object and add to batch."""
         global packet_batch
-        
+
         try:
+            # ── IP layer ──────────────────────────────────────────────────────
+            has_ip = IP in pkt
+            src        = pkt[IP].src   if has_ip else "unknown"
+            dst        = pkt[IP].dst   if has_ip else "unknown"
+            proto      = pkt[IP].proto if has_ip else 0
+            ip_hdr_len = pkt[IP].ihl * 4 if has_ip else 0   # bytes
+
+            # ── Transport layer ───────────────────────────────────────────────
+            sport = int(pkt.sport) if hasattr(pkt, 'sport') else 0
+            dport = int(pkt.dport) if hasattr(pkt, 'dport') else 0
+
+            # ── TCP-specific ──────────────────────────────────────────────────
+            # Flag bits: FIN=0x01  SYN=0x02  RST=0x04  PSH=0x08  ACK=0x10  URG=0x20
+            has_tcp    = TCP in pkt
+            tcp_flags  = int(pkt[TCP].flags)      if has_tcp else 0
+            tcp_hdr_len = pkt[TCP].dataofs * 4    if has_tcp else 0  # bytes
+
             packet_info = {
-                "timestamp": time.time(),
-                "src": pkt["IP"].src if "IP" in pkt else "unknown",
-                "dst": pkt["IP"].dst if "IP" in pkt else "unknown",
-                "sport": pkt.sport if hasattr(pkt, "sport") else 0,
-                "dport": pkt.dport if hasattr(pkt, "dport") else 0,
-                "proto": pkt["IP"].proto if "IP" in pkt else 0,
-                "size": len(pkt),
-                "info": pkt.summary()
+                "timestamp":   time.time(),
+                "src":         src,
+                "dst":         dst,
+                "sport":       sport,
+                "dport":       dport,
+                "proto":       proto,
+                "size":        len(pkt),
+                "ip_hdr_len":  ip_hdr_len,    # for Fwd/Bwd Header Length
+                "tcp_hdr_len": tcp_hdr_len,   # for Fwd/Bwd Header Length
+                "flags":       tcp_flags,     # raw TCP flags bitmask
             }
             packet_batch.append(packet_info)
         except Exception as e:
             logger.error(f"Error processing packet: {e}")
+
 
     async def process_packet(self, pkt):
         """Process individual packet and manage batching"""

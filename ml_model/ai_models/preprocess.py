@@ -2,45 +2,56 @@ import pandas as pd
 import numpy as np
 import glob
 import json
-from sklearn.preprocessing import StandardScaler
 import os
 
-# Use relative path for better portability
-raw_data_path = r'C:\Users\saket\3-2Mini\secureflow\datasets\raw'
-processed_data_path = r'C:\Users\saket\3-2Mini\secureflow\datasets\processed\processed.csv'
-feature_list_path = r'C:\Users\saket\3-2Mini\secureflow\ml_model\ml_core\feature_list.json'
+# ── Paths ──────────────────────────────────────────────────────────────────────
+raw_data_path       = r'C:\Users\saket\3-2Mini\datasets\raw'
+processed_data_path = r'C:\Users\saket\3-2Mini\datasets\processed\processed_new.csv'
+feature_list_path   = r'C:\Users\saket\3-2Mini\secureflow\ml_model\ml_core\feature_list1.json'
 
+# NOTE: StandardScaler is intentionally NOT applied here.
+#       Scaling must be fit on training data only (inside each training script)
+#       to prevent data leakage between train and test splits.
+
+# ── Attack label normalisation ─────────────────────────────────────────────────
 ATTACK_MAPPING = {
-    "BENIGN": "Normal",
-    "DoS Hulk": "DoS", "DoS GoldenEye": "DoS", "DoS slowloris": "DoS",
-    "DDoS": "DDoS",
-    "FTP-Patator": "BruteForce", "SSH-Patator": "BruteForce",
-    "Web Attack - XSS": "WebAttack",
+    "BENIGN":                   "Normal",
+    "DoS Hulk":                 "DoS",
+    "DoS GoldenEye":            "DoS",
+    "DoS slowloris":            "DoS",
+    "DoS Slowhttptest":         "DoS",
+    "DDoS":                     "DDoS",
+    "FTP-Patator":              "BruteForce",
+    "SSH-Patator":              "BruteForce",
+    "Web Attack \x96 XSS":      "WebAttack",
+    "Web Attack - XSS":         "WebAttack",
+    "Web Attack \x96 Sql Injection": "WebAttack",
     "Web Attack - Sql Injection": "WebAttack",
+    "Web Attack \x96 Brute Force": "WebAttack",
     "Web Attack - Brute Force": "WebAttack",
-    "PortScan": "PortScan",
-    "Bot": "Botnet",
-    "Infiltration": "Infiltration"
+    "PortScan":                 "PortScan",
+    "Bot":                      "Botnet",
+    "Infiltration":             "Infiltration",
+    "Heartbleed":               "Heartbleed",
 }
 
+# ── Columns to drop ────────────────────────────────────────────────────────────
+# Removed " Destination Port" from DROP_COLS — it is a high-signal feature
+# for PortScan, SSH-Patator, FTP-Patator and should be kept.
 DROP_COLS = [
     # Broken / corrupted fields
     "Init_Win_bytes_forward",
     " Init_Win_bytes_backward",
 
-    # Duplicate / redundant packet-length stats
+    # Redundant packet-length stats (keep Mean only)
     " Fwd Packet Length Max",
     " Fwd Packet Length Min",
     " Fwd Packet Length Std",
     "Bwd Packet Length Max",
     " Bwd Packet Length Min",
     " Bwd Packet Length Std",
-
-    # Redundant packet summary stats
     " Min Packet Length",
     " Max Packet Length",
-    " Fwd Packet Length Std",  # Using Fwd version to avoid conflict
-    " Bwd Packet Length Std",   # Using Bwd version to avoid conflict
 
     # Bulk features (always zero in CICIDS-2017)
     "Fwd Avg Bytes/Bulk",
@@ -50,85 +61,103 @@ DROP_COLS = [
     " Bwd Avg Packets/Bulk",
     "Bwd Avg Bulk Rate",
 
-    # Subflow duplicates (same info as Tot_Fwd_Pkts, Tot_Bwd_Pkts)
+    # Subflow duplicates (same info as Tot_Fwd/Bwd_Pkts)
     "Subflow Fwd Packets",
     " Subflow Fwd Bytes",
     " Subflow Bwd Packets",
     " Subflow Bwd Bytes",
 
-    # Useless ratio
+    # Low-signal / always-zero flags
     " Down/Up Ratio",
-
-    # Flags that are nearly always zero (no signal)
     " CWE Flag Count",
     " ECE Flag Count",
     " URG Flag Count",
 
-    # Excessive IAT features (keep only Mean + Std)
+    # Redundant IAT extremes (keep Mean + Std)
     " Flow IAT Max",
     " Flow IAT Min",
     " Fwd IAT Max",
     " Fwd IAT Min",
     " Bwd IAT Max",
     " Bwd IAT Min",
-    " Destination Port",
+
+    # Duplicate header-length column
+    " Fwd Header Length.1",
 ]
 
-def load_data():
-    # Fix: Add proper path separator between directory and pattern
+
+def load_data() -> pd.DataFrame:
+    """Read and concatenate all raw CSV files, drop unwanted columns, clean NaNs."""
     all_files = glob.glob(os.path.join(raw_data_path, '*.csv'))
-    # print(f"Found {len(all_files)} CSV files:")
-    # for f in all_files:
-    #     print(f"  - {f}")
-    
+    if not all_files:
+        raise FileNotFoundError(f"No CSV files found in: {raw_data_path}")
+
     dfs = []
     for f in all_files:
-        df = pd.read_csv(f)
-        print(f"  Shape: {df.shape}")
-        for c in df.columns:
-            if c in DROP_COLS:
-                df.drop(c, axis=1, inplace=True)
-        print(f"  Shape: {df.shape}")
+        df = pd.read_csv(f, low_memory=False)
+        print(f"  Loaded {f}  shape={df.shape}")
+
+        # Drop unwanted columns (only those that exist)
+        cols_to_drop = [c for c in DROP_COLS if c in df.columns]
+        df.drop(columns=cols_to_drop, inplace=True)
+
+        # Replace inf values
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.fillna(0, inplace=True)
-        
-        # Fix: Handle case where 'Label' column might not exist
+
+        # Normalise label column
+        label_col = None
         if ' Label' in df.columns:
-            df[" Label"] = df[" Label"].map(ATTACK_MAPPING)
-        else:
-            print(f"Warning: Neither 'Lable' nor 'Label' column found in {f}")
+            label_col = ' Label'
+        elif 'Label' in df.columns:
+            label_col = 'Label'
+
+        if label_col is None:
+            print(f"  WARNING: No 'Label' column in {f} — skipping file.")
             continue
-            
+
+        df[label_col] = df[label_col].map(ATTACK_MAPPING)
+        unmapped = df[label_col].isna().sum()
+        if unmapped:
+            print(f"  WARNING: {unmapped} rows had unmapped labels in {f} — dropping them.")
+            df.dropna(subset=[label_col], inplace=True)
+
+        # Rename to canonical "Label"
+        if label_col != 'Label':
+            df.rename(columns={label_col: 'Label'}, inplace=True)
+
         dfs.append(df)
-    
+        print(f"  After clean  shape={df.shape}")
+
     if not dfs:
-        raise ValueError("No valid dataframes loaded. Check file paths and column names.")
-    
+        raise ValueError("No valid DataFrames loaded. Check file paths and column names.")
+
     dataset = pd.concat(dfs, ignore_index=True)
-    print(f"Final dataset shape: {dataset.shape}")
+    print(f"\nFinal dataset shape: {dataset.shape}")
+    print("Label distribution:\n", dataset['Label'].value_counts())
     return dataset
 
-def preprocessing():
-    # Fix: load_data() already returns a DataFrame, don't call pd.read_csv on it
-    dataset = load_data()
-    X = dataset.iloc[:, :-1]
-    Y = dataset.iloc[:, -1]
-    
-    scaler = StandardScaler()
-    X_s = scaler.fit_transform(X)
-    process_data = pd.DataFrame(X_s, columns=X.columns)
-    process_data["Label"] = Y
-    
-    # Ensure processed directory exists
-    os.makedirs(os.path.dirname(processed_data_path), exist_ok=True)
-    process_data.to_csv(processed_data_path, index=False)
-    # print(f"Processed data saved to: {processed_data_path}")
 
-    # Fix: Remove extra quote in JSON file path
+def preprocessing():
+    """Save raw (unscaled) processed CSV + feature list."""
+    dataset = load_data()
+
+    # Put Label last
+    cols = [c for c in dataset.columns if c != 'Label'] + ['Label']
+    dataset = dataset[cols]
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(processed_data_path), exist_ok=True)
+    dataset.to_csv(processed_data_path, index=False)
+    print(f"\nProcessed data saved to: {processed_data_path}")
+
+    # Save feature list (all columns except Label)
+    feature_cols = [c for c in dataset.columns if c != 'Label']
     os.makedirs(os.path.dirname(feature_list_path), exist_ok=True)
-    with open(feature_list_path, "w") as f:
-        json.dump(list(X.columns), f)
-    # print(f"Feature list saved to: {feature_list_path}")
-    
+    with open(feature_list_path, 'w') as f:
+        json.dump(feature_cols, f)
+    print(f"Feature list saved to:   {feature_list_path}  ({len(feature_cols)} features)")
+
+
 if __name__ == "__main__":
     preprocessing()
