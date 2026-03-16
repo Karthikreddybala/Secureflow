@@ -11,6 +11,7 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from sklearn.discriminant_analysis import StandardScaler
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,7 @@ def fusion_engine(rf_label, rf_confidence, iso_score):
             'severity': severity
         }
 
-    if iso_score > 0.3:
+    if iso_score > 0.25:
         return {
             'final_score': round(min(MAX_Y_ALERT_SCORE, iso_score * 100.0), 2),
             'attack_type': 'Anomaly',
@@ -151,6 +152,7 @@ def _ingest_packet_locked(packet):
 
 
 def _compute_features(flow):
+    print(flow['sizes'])
     timestamps = flow['timestamps']
     sizes = flow['sizes']
     fwd_sizes = flow['fwd_sizes']
@@ -233,16 +235,20 @@ def _predict_alerts(flow_items):
     feature_rows = []
     for _, flow in flow_items:
         feature_rows.append(_prepare_model_row(_compute_features(flow)))
+    
 
     frame = pd.DataFrame(feature_rows, columns=FEATURES).fillna(0.0)
-
-    rf_pred = rf.predict(frame)
+    scaler = StandardScaler()
+    X_s = scaler.fit_transform(frame)
+    rf_pred = rf.predict(X_s)
     if hasattr(rf, 'predict_proba'):
-        rf_prob = rf.predict_proba(frame).max(axis=1)
+        rf_prob = rf.predict_proba(X_s).max(axis=1)
     else:
         rf_prob = np.ones(len(flow_items), dtype=float)
+    
 
     iso_scores = np.abs(iso.decision_function(frame))
+    print(rf_pred, rf_prob, iso_scores)
 
     alerts = []
     for index, (fid, _) in enumerate(flow_items):

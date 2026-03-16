@@ -3,9 +3,10 @@ import websockets
 import json
 import time
 import logging
-import threading
 import queue
+from scapy.all import sniff, PcapReader
 from scapy.all import sniff
+import sys
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -13,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 WS_SERVER = "ws://127.0.0.1:8000/ws/packets/"
 
-PACKET_BATCH_SIZE = 50
-PACKET_BATCH_TIME = 1
+PACKET_BATCH_SIZE = 100
+PACKET_BATCH_TIME = 0.5  # seconds
 
 # Global variables
 packet_batch = []
@@ -24,7 +25,7 @@ ws_lock = asyncio.Lock()
 shutdown_event = asyncio.Event()
 
 # Thread-safe packet queue for communication between threads
-packet_queue = queue.Queue()
+packet_queue = queue.Queue(maxsize=5000)
 packet_processing_task = None
 
 class PacketProcessor:
@@ -33,37 +34,24 @@ class PacketProcessor:
         self.ws_lock = asyncio.Lock()
         self.shutdown_event = asyncio.Event()
         self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 10
-        self.heartbeat_interval = 30  # seconds
+        self.max_reconnect_attempts = None
+        self.heartbeat_interval = 10  # seconds
         self.connection_state = "disconnected"  # disconnected, connecting, connected, reconnecting
         self.last_connection_attempt = 0
-        self.min_reconnect_delay = 2  # Minimum delay between reconnection attempts
-        self.max_reconnect_delay = 60  # Maximum delay between reconnection attempts
+        self.min_reconnect_delay = 1  # Minimum delay between reconnection attempts
+        self.max_reconnect_delay = 15  # Maximum delay between reconnection attempts
         self.main_event_loop = None  # Store reference to main event loop
         self.packet_processing_enabled = True  # Control packet processing
         
     async def connect_ws(self):
         """Establish WebSocket connection with retry logic"""
         current_attempt = 0
-        
-        # Check if we should wait before attempting to reconnect
-        now = time.time()
-        if self.last_connection_attempt > 0:
-            time_since_last_attempt = now - self.last_connection_attempt
-            min_delay = self.min_reconnect_delay * (2 ** min(current_attempt, 6))  # Cap exponential backoff
-            min_delay = min(min_delay, self.max_reconnect_delay)
-            
-            if time_since_last_attempt < min_delay:
-                wait_time = min_delay - time_since_last_attempt
-                logger.info(f"Waiting {wait_time:.1f}s before next connection attempt")
-                await asyncio.sleep(wait_time)
-        
-        self.last_connection_attempt = now
         self.connection_state = "connecting"
-        
+
         while not self.shutdown_event.is_set():
             current_attempt += 1
             try:
+                self.last_connection_attempt = time.time()
                 logger.info(f"Connecting to WebSocket server: {WS_SERVER} (attempt {current_attempt})")
                 self.ws_connection = await websockets.connect(
                     WS_SERVER,
@@ -77,16 +65,12 @@ class PacketProcessor:
                 return True
             except Exception as e:
                 self.reconnect_attempts += 1
-                wait_time = min(2 ** current_attempt, self.max_reconnect_delay)  # Exponential backoff, max 60s
+                wait_time = min(self.min_reconnect_delay * (2 ** min(current_attempt - 1, 5)), self.max_reconnect_delay)
                 logger.error(f"WebSocket connection failed (attempt {current_attempt}): {e}")
-                
-                if current_attempt >= self.max_reconnect_attempts:
-                    logger.error("Max reconnection attempts reached. Giving up.")
-                    self.connection_state = "disconnected"
-                    return False
-                
                 logger.info(f"Retrying connection in {wait_time} seconds...")
                 await asyncio.sleep(wait_time)
+
+        self.connection_state = "disconnected"
         return False
 
     async def disconnect_ws(self):
@@ -112,8 +96,7 @@ class PacketProcessor:
             if self.connection_state != "connected" or not self.ws_connection:
                 logger.warning(f"WebSocket not connected (state: {self.connection_state}), attempting to reconnect...")
                 if not await self.connect_ws():
-                    logger.error("Failed to reconnect, dropping packet batch")
-                    packet_batch = []  # Clear batch if can't reconnect
+                    logger.error("Failed to reconnect, keeping packet batch for retry")
                     return
 
             try:
@@ -128,16 +111,14 @@ class PacketProcessor:
                 await self.ws_connection.send(json.dumps({
                     "packets": packet_batch
                 }))
-                logger.info(f"Sent batch: {len(packet_batch)} packets")
+                logger.debug(f"Sent batch: {len(packet_batch)} packets")
                 packet_batch = []
             except websockets.exceptions.ConnectionClosed as e:
                 logger.error(f"WebSocket connection closed: {e}")
                 self.ws_connection = None
                 self.connection_state = "disconnected"
-                # Try to reconnect and resend (with delay to prevent rapid reconnection)
-                await asyncio.sleep(1)  # Small delay before retry
-                if await self.connect_ws():
-                    await self.send_packet_batch()  # Retry sending
+                # Keep current batch intact; next cycle will reconnect and retry.
+                return
             except RuntimeError as e:
                 if "Event loop is closed" in str(e):
                     logger.critical("Event loop has been closed - this indicates a serious issue")
@@ -234,8 +215,8 @@ class PacketProcessor:
         """Process packets from the queue in the main event loop"""
         while not self.shutdown_event.is_set():
             try:
-                # Get packet from queue with timeout to allow for shutdown
-                pkt = packet_queue.get(timeout=1)
+                # Avoid blocking the async loop with Queue.get from a worker thread.
+                pkt = await asyncio.to_thread(packet_queue.get, True, 1)
                 
                 # Process the packet
                 await self.process_packet(pkt)
@@ -252,6 +233,7 @@ class PacketProcessor:
     async def start_capture(self, interface="Wi-Fi"):
         """Start packet capture with graceful shutdown support"""
         logger.info(f"Starting packet capture on interface: {interface}")
+        self.main_event_loop = asyncio.get_running_loop()
         
         # Start heartbeat task
         heartbeat_task = asyncio.create_task(self.heartbeat())
@@ -297,6 +279,41 @@ class PacketProcessor:
         await self.disconnect_ws()
 
 
+
+    async def replay_pcap(self, pcap_file):
+        """Replay packets from a PCAP file and feed them into the same processing pipeline"""
+        
+        logger.info(f"Starting PCAP replay: {pcap_file}")
+
+        prev_time = None
+        packet_count = 0
+
+        try:
+            for pkt in PcapReader(pcap_file):
+
+                if self.shutdown_event.is_set():
+                    break
+
+                # simulate realistic timing
+                if prev_time is not None:
+                    delay = pkt.time - prev_time
+                    if delay > 0:
+                        await asyncio.sleep(min(delay, 0.05))
+
+                prev_time = pkt.time
+                packet_count += 1
+
+                try:
+                    packet_queue.put_nowait(pkt)
+                except queue.Full:
+                    logger.warning("Packet queue full during PCAP replay, dropping packet")
+
+            logger.info(f"Finished PCAP replay. Packets processed: {packet_count}")
+
+        except Exception as e:
+            logger.error(f"Error during PCAP replay: {e}")
+
+
 async def main():
     """Main function with proper error handling and shutdown"""
     processor = PacketProcessor()
@@ -307,8 +324,18 @@ async def main():
             logger.error("Failed to connect to WebSocket server")
             return
 
-        # Start packet capture
-        await processor.start_capture("Wi-Fi")
+        # Start queue processor
+        asyncio.create_task(processor.process_packets_from_queue())
+
+        # PCAP replay mode
+        if len(sys.argv) > 1:
+            print("Replaying packets from PCAP file:", sys.argv[1])
+            pcap_file = sys.argv[1]
+            await processor.replay_pcap(pcap_file)
+
+        # Live capture mode
+        else:
+            await processor.start_capture("Wi-Fi")
         
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt")
@@ -316,6 +343,26 @@ async def main():
         logger.error(f"Unexpected error: {e}")
     finally:
         await processor.shutdown()
+
+# async def main():
+#     """Main function with proper error handling and shutdown"""
+#     processor = PacketProcessor()
+    
+#     try:
+#         # Connect to WebSocket
+#         if not await processor.connect_ws():
+#             logger.error("Failed to connect to WebSocket server")
+#             return
+
+#         # Start packet capture
+#         await processor.start_capture("Wi-Fi")
+        
+#     except KeyboardInterrupt:
+#         logger.info("Received keyboard interrupt")
+#     except Exception as e:
+#         logger.error(f"Unexpected error: {e}")
+#     finally:
+#         await processor.shutdown()
 
 
 if __name__ == "__main__":

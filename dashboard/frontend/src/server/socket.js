@@ -1,5 +1,5 @@
-const RECONNECT_BASE_MS = 3000
-const MAX_RECONNECT_ATTEMPTS = 10
+const RECONNECT_BASE_MS = 1000
+const MAX_RECONNECT_DELAY_MS = 5000
 
 const resolveBaseSocketUrl = () => {
   const envBase = import.meta?.env?.VITE_WS_BASE_URL
@@ -126,12 +126,11 @@ class WebSocketManager {
           return
         }
 
-        if (this.alertReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-          return
-        }
-
         this.alertReconnectAttempts += 1
-        const retryDelay = RECONNECT_BASE_MS * this.alertReconnectAttempts
+        const retryDelay = Math.min(
+          RECONNECT_BASE_MS * Math.pow(2, this.alertReconnectAttempts - 1),
+          MAX_RECONNECT_DELAY_MS
+        )
         this.alertReconnectTimer = setTimeout(() => this.connectAlerts(), retryDelay)
       }
     } catch (error) {
@@ -177,12 +176,11 @@ class WebSocketManager {
           return
         }
 
-        if (this.networkReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-          return
-        }
-
         this.networkReconnectAttempts += 1
-        const retryDelay = RECONNECT_BASE_MS * this.networkReconnectAttempts
+        const retryDelay = Math.min(
+          RECONNECT_BASE_MS * Math.pow(2, this.networkReconnectAttempts - 1),
+          MAX_RECONNECT_DELAY_MS
+        )
         this.networkReconnectTimer = setTimeout(() => this.connectNetwork(), retryDelay)
       }
     } catch (error) {

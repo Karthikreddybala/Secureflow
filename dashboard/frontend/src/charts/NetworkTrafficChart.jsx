@@ -26,10 +26,20 @@ function NetworkTrafficChart() {
   const [followLatest, setFollowLatest] = useState(true)
   const chartRef = useRef(null)
   const scrollShellRef = useRef(null)
+  const lastPointCountRef = useRef(-1)
 
   useEffect(() => {
     const updateChartData = () => {
-      setChartData(chartDataManager.getNetworkTrafficData())
+      const nextData = chartDataManager.getNetworkTrafficData()
+      const pointCount = nextData.labels.length
+
+      // Re-render only when a new point is appended.
+      if (pointCount === lastPointCountRef.current) {
+        return
+      }
+
+      lastPointCountRef.current = pointCount
+      setChartData(nextData)
     }
 
     updateChartData()
@@ -39,7 +49,8 @@ function NetworkTrafficChart() {
 
   const chartWidth = useMemo(() => {
     const points = Math.max(chartData.labels.length, 34)
-    return Math.max(MIN_TRACK_WIDTH, points * PIXELS_PER_POINT)
+    // Keep point spacing constant so existing lines stay visually fixed.
+    return Math.max(MIN_TRACK_WIDTH, (points - 1) * PIXELS_PER_POINT)
   }, [chartData.labels.length])
 
   useEffect(() => {
@@ -134,8 +145,14 @@ function NetworkTrafficChart() {
       }
     },
     animation: {
-      duration: 180,
-      easing: 'linear'
+      duration: 0
+    },
+    transitions: {
+      active: {
+        animation: {
+          duration: 0
+        }
+      }
     }
   }
 

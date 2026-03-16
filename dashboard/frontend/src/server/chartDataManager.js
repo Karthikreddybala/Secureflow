@@ -1,4 +1,4 @@
-const HISTORY_LIMIT = 240
+const HISTORY_LIMIT = 5000
 const MAX_Y_VALUE = 100
 
 const createNetworkTrafficTemplate = () => ({

@@ -1,8 +1,13 @@
+import asyncio
 import json
+import logging
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
 
 from .views import process_packet_batch
+
+logger = logging.getLogger(__name__)
+PROCESSING_QUEUE_MAX = 128
 
 class AlertConsumer(AsyncWebsocketConsumer):
 
@@ -60,11 +65,30 @@ class NetworkTrafficConsumer(AsyncWebsocketConsumer):
 class PacketConsumer(AsyncWebsocketConsumer):
 
     async def connect(self):
+        self.packet_queue = asyncio.Queue(maxsize=PROCESSING_QUEUE_MAX)
+        self.processor_task = asyncio.create_task(self._process_packet_queue())
         await self.accept()
-        print("Packet sensor connected")
+        logger.info("Packet sensor connected")
 
     async def disconnect(self, close_code):
-        print("Packet sensor disconnected")
+        if hasattr(self, "processor_task") and self.processor_task:
+            self.processor_task.cancel()
+            try:
+                await self.processor_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Packet sensor disconnected")
+
+    async def _process_packet_queue(self):
+        while True:
+            packets = await self.packet_queue.get()
+            try:
+                # Run heavy flow/ML processing off the receive path.
+                await sync_to_async(process_packet_batch, thread_sensitive=False)(packets, False)
+            except Exception:
+                logger.exception("Error processing packet batch")
+            finally:
+                self.packet_queue.task_done()
 
     async def receive(self, text_data):
         try:
@@ -72,10 +96,7 @@ class PacketConsumer(AsyncWebsocketConsumer):
             packets = data.get("packets", [])
             
             if not packets:
-                print("No packets received")
                 return
-
-            print(f"Received {len(packets)} packets from sensor")
 
             # Send packets to dashboard via network_traffic group
             channel_layer = self.channel_layer
@@ -87,10 +108,16 @@ class PacketConsumer(AsyncWebsocketConsumer):
                 }
             )
 
-            # Process packet batch in one call to reduce per-packet async overhead.
-            await sync_to_async(process_packet_batch)(packets, False)
+            # Queue ML processing so receive stays low-latency.
+            try:
+                self.packet_queue.put_nowait(packets)
+            except asyncio.QueueFull:
+                # Drop the oldest queued batch under overload to preserve freshness.
+                _ = self.packet_queue.get_nowait()
+                self.packet_queue.task_done()
+                self.packet_queue.put_nowait(packets)
             
-        except json.JSONDecodeError as e:
-            print(f"JSON decode error: {e}")
-        except Exception as e:
-            print(f"Error processing packet data: {e}")
+        except json.JSONDecodeError as error:
+            logger.error("JSON decode error: %s", error)
+        except Exception:
+            logger.exception("Error processing packet data")
