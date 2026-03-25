@@ -1,123 +1,64 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Registerapi } from '../server/api.js';
-import './css/login.css';
+import { useAuth } from '../context/AuthContext';
 
-function Register() {
+export default function Register() {
+  const { register } = useAuth();
   const navigate = useNavigate();
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [errorMessage, setErrorMessage] = useState('');
+  const [form, setForm]   = useState({ username: '', password: '', confirm: '' });
+  const [error, setError] = useState('');
+  const [ok, setOk]       = useState('');
+  const [loading, setLoading] = useState(false);
 
-  const handleSubmit = async (event) => {
-    event.preventDefault();
-    setErrorMessage('');
-
-    if (!email.trim() || !password.trim()) {
-      setErrorMessage('Email and password are required.');
-      return;
-    }
-
-    if (password.length < 6) {
-      setErrorMessage('Password must be at least 6 characters.');
-      return;
-    }
-
-    if (password !== confirmPassword) {
-      setErrorMessage('Password confirmation does not match.');
-      return;
-    }
-
-    try {
-      setIsSubmitting(true);
-      const response = await Registerapi(email, password);
-
-      if (response && (response.status === 'success' || response.success === true)) {
-        navigate('/login');
-        return;
-      }
-
-      setErrorMessage('Registration failed. Please try with a different email.');
-    } catch {
-      setErrorMessage('Unable to complete registration right now.');
-    } finally {
-      setIsSubmitting(false);
-    }
+  const handleSubmit = async (e) => {
+    e.preventDefault(); setError(''); setOk('');
+    if (form.password !== form.confirm) { setError('Passwords do not match'); return; }
+    if (form.password.length < 6) { setError('Password must be at least 6 characters'); return; }
+    setLoading(true);
+    const result = await register(form.username, form.password);
+    setLoading(false);
+    if (result.success) {
+      setOk('Account created! Redirecting to login…');
+      setTimeout(() => navigate('/login'), 1500);
+    } else { setError(result.error || 'Registration failed'); }
   };
 
   return (
-    <div className="cyber-page auth-page">
-      <div className="auth-shell">
-        <section className="auth-left cyber-panel register-surface">
-          <span className="auth-chip">Identity Enrollment</span>
-          <h1>Create your operator profile for Secureflow AI.</h1>
-          <p>
-            Register a new analyst account to access network telemetry intelligence, threat analytics, and incident monitoring dashboards.
-          </p>
+    <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-base)' }}>
+      <div style={{ width: '100%', maxWidth: 400, background: 'rgba(8,14,31,0.90)', border: '1px solid rgba(0,245,212,0.2)', borderRadius: 24, padding: '40px 36px', boxShadow: '0 8px 64px rgba(0,0,0,0.7)', backdropFilter: 'blur(20px)', animation: 'fadeInUp 0.4s ease' }}>
+        <div style={{ textAlign: 'center', marginBottom: 32 }}>
+          <div style={{ fontSize: '2.4rem', marginBottom: 6 }}>⬡</div>
+          <h1 style={{ fontSize: '1.45rem', fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
+            Create Account
+          </h1>
+          <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: 5 }}>SecureFlow IDS access request</p>
+        </div>
 
-          <ul className="auth-value-list">
-            <li>Role-focused interface for SOC and IR workflows</li>
-            <li>Centralized event visibility and alert processing</li>
-            <li>Fast access to traffic intelligence and threat trend pages</li>
-          </ul>
-        </section>
+        {error && <div style={{ background: 'rgba(255,69,96,0.12)', border: '1px solid rgba(255,69,96,0.3)', borderRadius: 8, padding: '10px 14px', color: 'var(--danger)', fontSize: '0.85rem', marginBottom: 18 }}>⚠ {error}</div>}
+        {ok && <div style={{ background: 'rgba(0,230,118,0.1)', border: '1px solid rgba(0,230,118,0.3)', borderRadius: 8, padding: '10px 14px', color: 'var(--success)', fontSize: '0.85rem', marginBottom: 18 }}>✅ {ok}</div>}
 
-        <section className="auth-right cyber-panel">
-          <div className="auth-form-header">
-            <h2>Register Account</h2>
-            <p>Provision credentials for analyst access.</p>
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <div>
+            <label className="sf-label">Email</label>
+            <input className="sf-input" type="email" placeholder="you@example.com" value={form.username} onChange={e => setForm(f => ({ ...f, username: e.target.value }))} required />
           </div>
+          <div>
+            <label className="sf-label">Password</label>
+            <input className="sf-input" type="password" placeholder="Min 6 characters" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} required />
+          </div>
+          <div>
+            <label className="sf-label">Confirm Password</label>
+            <input className="sf-input" type="password" placeholder="Repeat password" value={form.confirm} onChange={e => setForm(f => ({ ...f, confirm: e.target.value }))} required />
+          </div>
+          <button type="submit" className="sf-btn sf-btn-primary" style={{ width: '100%', justifyContent: 'center', padding: '11px', marginTop: 4 }} disabled={loading}>
+            {loading ? 'Creating…' : '→ Create Account'}
+          </button>
+        </form>
 
-          <form className="auth-form" onSubmit={handleSubmit}>
-            <label htmlFor="register-email">Email</label>
-            <input
-              id="register-email"
-              type="email"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              placeholder="new-analyst@secureflow.ai"
-              autoComplete="email"
-            />
-
-            <label htmlFor="register-password">Password</label>
-            <input
-              id="register-password"
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              placeholder="Create password"
-              autoComplete="new-password"
-            />
-
-            <label htmlFor="register-confirm-password">Confirm Password</label>
-            <input
-              id="register-confirm-password"
-              type="password"
-              value={confirmPassword}
-              onChange={(event) => setConfirmPassword(event.target.value)}
-              placeholder="Repeat password"
-              autoComplete="new-password"
-            />
-
-            <div className="auth-form-row">
-              <span className="auth-hint">Already have access?</span>
-              <button type="button" className="auth-link-btn" onClick={() => navigate('/login')}>
-                Go to login
-              </button>
-            </div>
-
-            {errorMessage && <p className="auth-error">{errorMessage}</p>}
-
-            <button type="submit" className="auth-submit-btn" disabled={isSubmitting}>
-              {isSubmitting ? 'Creating Account...' : 'Create Account'}
-            </button>
-          </form>
-        </section>
+        <p style={{ textAlign: 'center', marginTop: 20, color: 'var(--text-muted)', fontSize: '0.8rem' }}>
+          Already have an account? <a href="/login" style={{ color: 'var(--accent)', textDecoration: 'none', fontWeight: 600 }}>Sign In</a>
+        </p>
       </div>
     </div>
   );
 }
-
-export default Register;

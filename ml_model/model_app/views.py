@@ -634,7 +634,13 @@ def _predict_alerts(flow_items):
 
         alerts.append(alert)
 
-        # Store for export (in-memory ring buffer)
+        # ── Persist classified flow to NetworkFlow table ──────────────────────
+        try:
+            _persist_flow(fid, flow_items[idx][1], alert)
+        except Exception as _pf_err:
+            logger.debug('_persist_flow skipped: %s', _pf_err)
+
+
         global _recent_alerts
         _recent_alerts = (_recent_alerts + alerts)[-_MAX_RECENT:]
 
@@ -1138,3 +1144,277 @@ def get_log_lines(request):
         return _cors(JsonResponse({'lines': lines, 'path': str(log_path), 'total': len(all_lines)}))
     except Exception as exc:
         return _cors(JsonResponse({'lines': [f'Error reading log: {exc}'], 'path': str(log_path)}))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── CAPTURE CONTROL (start/stop pp.py subprocess) ─────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+import sys as _sys
+_capture_process: subprocess.Popen | None = None
+_capture_lock = threading.Lock()
+
+
+def _capture_is_running():
+    global _capture_process
+    return _capture_process is not None and _capture_process.poll() is None
+
+
+@csrf_exempt
+def capture_control(request):
+    """
+    GET  /model_app/capture          → { running: bool }
+    POST /model_app/capture          → { action: "start"|"stop", mode: "live"|"pcap" }
+    """
+    global _capture_process
+
+    # ── Handle CORS preflight explicitly ─────────────────────────────────────
+    if request.method == 'OPTIONS':
+        resp = JsonResponse({})
+        resp['Access-Control-Allow-Origin']  = '*'
+        resp['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        resp['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return resp
+
+    if request.method == 'GET':
+        return _cors(JsonResponse({'running': _capture_is_running()}))
+
+    if request.method != 'POST':
+        return _cors(JsonResponse({'error': 'GET or POST only'}, status=405))
+
+
+    try:
+        body = json.loads(request.body or '{}')
+    except Exception:
+        body = {}
+
+    action = body.get('action', 'start')
+
+    if action == 'stop':
+        with _capture_lock:
+            if _capture_is_running():
+                _capture_process.terminate()
+                try:
+                    _capture_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _capture_process.kill()
+                _capture_process = None
+                logger.info('Packet capture stopped by API.')
+                return _cors(JsonResponse({'status': 'stopped'}))
+            else:
+                return _cors(JsonResponse({'status': 'not_running'}))
+
+    # action == 'start'
+    with _capture_lock:
+        if _capture_is_running():
+            return _cors(JsonResponse({'status': 'already_running'}))
+
+        pp_path = Path(__file__).resolve().parents[1] / 'engine' / 'pp.py'
+        mode    = body.get('mode', 'live')
+        cmd     = [_sys.executable, str(pp_path)]
+
+        if mode == 'pcap':
+            pcap_file = body.get('pcap_file', '')
+            if pcap_file:
+                cmd.append(pcap_file)
+            else:
+                return _cors(JsonResponse({'error': 'pcap_file required for pcap mode'}, status=400))
+
+        try:
+            _capture_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            logger.info('Packet capture started. PID: %s', _capture_process.pid)
+            return _cors(JsonResponse({'status': 'started', 'pid': _capture_process.pid, 'mode': mode}))
+        except Exception as exc:
+            logger.error('Failed to start capture: %s', exc)
+            return _cors(JsonResponse({'error': str(exc)}, status=500))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── NETWORK FLOWS — DB list + CSV download ────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+try:
+    from .models import NetworkFlow, BlockedIP
+except ImportError:
+    from model_app.models import NetworkFlow, BlockedIP
+
+
+def _persist_flow(fid, flow, alert):
+    """Save a completed + classified flow to the NetworkFlow table."""
+    try:
+        sizes    = flow.get('sizes', [])
+        fwd_sz   = flow.get('fwd_sizes', [])
+        bwd_sz   = flow.get('bwd_sizes', [])
+        ts       = flow.get('timestamps', [])
+        duration = (ts[-1] - ts[0]) if len(ts) > 1 else 0.0
+        f = alert.get('final', {})
+        NetworkFlow.objects.create(
+            start_time   = flow.get('first', time.time()),
+            end_time     = flow.get('last', time.time()),
+            src_ip       = fid[0] or None,
+            dst_ip       = fid[1] or None,
+            sport        = int(fid[2]) if str(fid[2]).isdigit() else None,
+            dport        = int(fid[3]) if str(fid[3]).isdigit() else None,
+            protocol     = _protocol_label(fid[4]),
+            bytes_fwd    = sum(fwd_sz),
+            bytes_bwd    = sum(bwd_sz),
+            packets_fwd  = len(fwd_sz),
+            packets_bwd  = len(bwd_sz),
+            flow_duration= duration,
+            attack_type  = f.get('attack_type', ''),
+            severity     = f.get('severity', ''),
+            confidence   = float(f.get('final_score', 0.0)),
+            is_simulated = alert.get('is_simulated', False),
+        )
+    except Exception as exc:
+        logger.warning('NetworkFlow persist failed: %s', exc)
+
+
+def list_network_flows(request):
+    """GET /model_app/flows — paginated list with optional filters."""
+    page         = max(1, int(request.GET.get('page', 1)))
+    limit        = min(int(request.GET.get('limit', 50)), 200)
+    attack_type  = request.GET.get('attack_type', '')
+    severity     = request.GET.get('severity', '')
+    date_from    = request.GET.get('date_from', '')
+    date_to      = request.GET.get('date_to', '')
+
+    qs = NetworkFlow.objects.all()
+    if attack_type:
+        qs = qs.filter(attack_type__icontains=attack_type)
+    if severity:
+        qs = qs.filter(severity__iexact=severity)
+    if date_from:
+        try:
+            qs = qs.filter(start_time__gte=float(date_from))
+        except Exception:
+            pass
+    if date_to:
+        try:
+            qs = qs.filter(start_time__lte=float(date_to))
+        except Exception:
+            pass
+
+    total  = qs.count()
+    offset = (page - 1) * limit
+    flows_data = [f.to_dict() for f in qs[offset:offset + limit]]
+    return _cors(JsonResponse({'flows': flows_data, 'total': total, 'page': page, 'limit': limit}))
+
+
+def download_network_flows(request):
+    """GET /model_app/flows/download — stream CSV of all stored flows."""
+    attack_type = request.GET.get('attack_type', '')
+    severity    = request.GET.get('severity', '')
+
+    qs = NetworkFlow.objects.all()
+    if attack_type:
+        qs = qs.filter(attack_type__icontains=attack_type)
+    if severity:
+        qs = qs.filter(severity__iexact=severity)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        'id', 'start_time', 'end_time', 'src_ip', 'dst_ip', 'sport', 'dport',
+        'protocol', 'bytes_fwd', 'bytes_bwd', 'packets_fwd', 'packets_bwd',
+        'flow_duration', 'attack_type', 'severity', 'confidence', 'is_simulated',
+    ])
+    for flow in qs.iterator(chunk_size=500):
+        writer.writerow([
+            flow.pk, flow.start_time, flow.end_time, flow.src_ip, flow.dst_ip,
+            flow.sport, flow.dport, flow.protocol, flow.bytes_fwd, flow.bytes_bwd,
+            flow.packets_fwd, flow.packets_bwd, round(flow.flow_duration, 4),
+            flow.attack_type, flow.severity, flow.confidence, flow.is_simulated,
+        ])
+
+    resp = HttpResponse(output.getvalue(), content_type='text/csv')
+    resp['Content-Disposition'] = 'attachment; filename="secureflow_flows.csv"'
+    return _cors(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── BLOCKED IPs — DB-backed list, system-level block/unblock ──────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _block_ip_db(ip: str, reason: str = '', blocked_by: str = 'system'):
+    """Block IP at firewall level and persist to DB."""
+    _block_ip_system(ip)  # existing netsh logic
+    BlockedIP.objects.update_or_create(
+        ip=ip,
+        defaults={
+            'reason':     reason,
+            'blocked_at': time.time(),
+            'blocked_by': blocked_by,
+            'is_active':  True,
+            'unblocked_at': None,
+            'unblocked_by': '',
+        }
+    )
+
+
+def _unblock_ip_db(ip: str, unblocked_by: str = 'system'):
+    """Remove firewall rule and mark DB record inactive."""
+    rule = f'SecureFlow_Block_{ip}'
+    try:
+        subprocess.run(
+            ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={rule}'],
+            capture_output=True, timeout=5
+        )
+    except Exception as exc:
+        logger.warning('Firewall unblock failed for %s: %s', ip, exc)
+    with _block_lock:
+        _blocked_ips.discard(ip)
+    BlockedIP.objects.filter(ip=ip).update(
+        is_active=False,
+        unblocked_at=time.time(),
+        unblocked_by=unblocked_by,
+    )
+    logger.info('Unblocked IP: %s (by %s)', ip, unblocked_by)
+
+
+@csrf_exempt
+def manage_blocked_ips_db(request):
+    """
+    GET  /model_app/blocked_ips_db            — paginated DB list
+    POST /model_app/blocked_ips_db            { ip, reason, blocked_by, action:'block'|'unblock' }
+    """
+    if request.method == 'GET':
+        page   = max(1, int(request.GET.get('page', 1)))
+        limit  = min(int(request.GET.get('limit', 50)), 200)
+        active_only = request.GET.get('active', 'false').lower() == 'true'
+        qs = BlockedIP.objects.all()
+        if active_only:
+            qs = qs.filter(is_active=True)
+        total  = qs.count()
+        offset = (page - 1) * limit
+        return _cors(JsonResponse({
+            'blocked_ips': [b.to_dict() for b in qs[offset:offset+limit]],
+            'total': total, 'page': page, 'limit': limit,
+        }))
+
+    if request.method == 'POST':
+        try:
+            body   = json.loads(request.body or '{}')
+            ip     = body.get('ip', '').strip()
+            action = body.get('action', 'block')
+
+            if not ip:
+                return _cors(JsonResponse({'error': 'ip required'}, status=400))
+
+            performer = body.get('blocked_by', body.get('unblocked_by', 'api'))
+
+            if action == 'unblock':
+                _unblock_ip_db(ip, unblocked_by=performer)
+                return _cors(JsonResponse({'status': 'unblocked', 'ip': ip}))
+            else:
+                reason = body.get('reason', 'Manual block via dashboard')
+                _block_ip_db(ip, reason=reason, blocked_by=performer)
+                return _cors(JsonResponse({'status': 'blocked', 'ip': ip}))
+
+        except Exception as exc:
+            return _cors(JsonResponse({'error': str(exc)}, status=500))
+
+    return _cors(JsonResponse({'error': 'Method not allowed'}, status=405))
+
