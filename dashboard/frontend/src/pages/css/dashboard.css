@@ -11,10 +11,10 @@
 }
 
 .dashboard-page {
-  --header-height: 68px;
-  height: calc(100vh - var(--header-height));
+  --header-height: 0px;
+  height: 100vh;
   min-height: 0;
-  padding: 8px;
+  padding: 10px 12px;
   background: var(--dashboard-bg);
   overflow: hidden;
 }
@@ -41,7 +41,7 @@
 }
 
 .dashboard-col-2 {
-  grid-template-rows: minmax(0, 1.42fr) minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) 160px 160px auto;
 }
 
 .dashboard-row,
@@ -56,6 +56,7 @@
 .pie-stage {
   min-height: 0;
   min-width: 0;
+  overflow: hidden;
 }
 
 .dashboard-panel,

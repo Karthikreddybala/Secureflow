@@ -6,7 +6,7 @@ const initialState = {
   alertCount: 0,
   alertFilter: 'all', // 'all', 'high', 'medium', 'low', 'normal'
   alertSort: 'newest', // 'newest', 'oldest', 'severity', 'score'
-  alertLimit: 50 // Maximum alerts to display
+  alertLimit: 100
 }
 
 export const alertsSlice = createSlice({
@@ -21,9 +21,8 @@ export const alertsSlice = createSlice({
         timestamp: action.payload.timestamp || Date.now()
       })
       
-      // Keep only last 200 alerts to prevent memory issues (increased from 100)
-      if (state.alerts.length > 200) {
-        state.alerts = state.alerts.slice(0, 200)
+      if (state.alerts.length > 1000) {
+        state.alerts = state.alerts.slice(0, 1000)
       }
       
       state.lastAlertTime = Date.now()

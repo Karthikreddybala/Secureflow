@@ -5,6 +5,10 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
 
 :root {
+  /* ── Sidebar dimensions ─────────────────────────── */
+  --sidebar-w:           220px;
+  --sidebar-w-collapsed:  62px;
+
   /* ── Color Palette ────────────────────────────────── */
   --bg-base:        #03060f;
   --bg-surface:     #080e1f;

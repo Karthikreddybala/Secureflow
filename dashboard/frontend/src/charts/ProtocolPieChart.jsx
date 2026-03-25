@@ -1,131 +1,81 @@
 import React, { useState, useEffect } from 'react';
-import { Card, CardHeader, CardBody } from 'react-bootstrap';
 import chartDataManager from '../server/chartDataManager.js';
 
-const PIE_CENTER = 150;
-const PIE_RADIUS = 118;
+const C = 80, R = 62;
+const PROTOCOLS = [
+  { name: 'TCP',   color: '#20d8de' },
+  { name: 'UDP',   color: '#41e28f' },
+  { name: 'ICMP',  color: '#ffbf47' },
+  { name: 'Other', color: '#7e9cbd' },
+];
+
+function buildSegments(data) {
+  const total = data.TCP + data.UDP + data.ICMP + data.Other;
+  if (!total) return [];
+  let start = -Math.PI / 2;
+  return PROTOCOLS.map(({ name, color }) => {
+    const v = data[name] || 0;
+    let a = (v / total) * 2 * Math.PI;
+    if (a >= 2 * Math.PI) a = 2 * Math.PI - 0.001;
+    const end = start + a;
+    const x1 = C + R * Math.cos(start), y1 = C + R * Math.sin(start);
+    const x2 = C + R * Math.cos(end),   y2 = C + R * Math.sin(end);
+    const path = `M${C} ${C} L${x1} ${y1} A${R} ${R} 0 ${a > Math.PI ? 1 : 0} 1 ${x2} ${y2}Z`;
+    start = end;
+    return { name, color, value: v, path };
+  });
+}
 
 function ProtocolPieChart() {
-    const [protocolData, setProtocolData] = useState(chartDataManager.getProtocolData());
+  const [data, setData] = useState(chartDataManager.getProtocolData());
 
-    useEffect(() => {
-        const updateProtocolData = () => {
-            const data = chartDataManager.getProtocolData();
-            setProtocolData(data);
-        };
+  useEffect(() => {
+    const tick = () => setData(chartDataManager.getProtocolData());
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, []);
 
-        updateProtocolData();
-        const interval = setInterval(updateProtocolData, 1000);
+  const segments = buildSegments(data);
 
-        return () => clearInterval(interval);
-    }, []);
+  return (
+    <div className="chart-card">
+      <div className="chart-card-header">
+        <h5>Protocol Distribution</h5>
+        <span className="chart-pill">{data.totalCount} TOTAL</span>
+      </div>
 
-    const calculatePieSegments = () => {
-        const total = protocolData.TCP + protocolData.UDP + protocolData.ICMP + protocolData.Other;
-        if (total === 0) return [];
+      <div className="chart-card-body" style={{ flexDirection: 'row', alignItems: 'center', gap: 14, padding: '8px 14px' }}>
+        {/* Compact donut SVG */}
+        <svg viewBox="0 0 160 160" style={{ width: 120, height: 120, flexShrink: 0 }}>
+          {segments.length ? segments.map(s => (
+            <path key={s.name} d={s.path} fill={s.color} stroke="rgba(6,20,35,0.9)" strokeWidth="1.5" opacity="0.95" />
+          )) : (
+            <circle cx={C} cy={C} r={R} fill="rgba(20,40,65,0.7)" />
+          )}
+          <circle cx={C} cy={C} r="38" fill="rgba(10,24,41,0.98)" stroke="rgba(95,139,184,0.3)" strokeWidth="1.5" />
+          <text x={C} y={C - 4} textAnchor="middle" fontSize="9" fill="#90abc7">packets</text>
+          <text x={C} y={C + 13} textAnchor="middle" fontSize="15" fontWeight="700" fill="#d7ecff">{data.totalCount}</text>
+        </svg>
 
-        const protocols = [
-            { name: 'TCP', value: protocolData.TCP, color: '#20d8de' },
-            { name: 'UDP', value: protocolData.UDP, color: '#41e28f' },
-            { name: 'ICMP', value: protocolData.ICMP, color: '#ffbf47' },
-            { name: 'Other', value: protocolData.Other, color: '#7e9cbd' }
-        ];
-
-        let startAngle = -Math.PI / 2;
-        const segments = [];
-
-        protocols.forEach((protocol) => {
-            const percentage = protocol.value / total;
-            let angle = percentage * 2 * Math.PI;
-            if (angle >= 2 * Math.PI) {
-                angle = 2 * Math.PI - 0.0001;
-            }
-
-            const endAngle = startAngle + angle;
-            const x1 = PIE_CENTER + PIE_RADIUS * Math.cos(startAngle);
-            const y1 = PIE_CENTER + PIE_RADIUS * Math.sin(startAngle);
-            const x2 = PIE_CENTER + PIE_RADIUS * Math.cos(endAngle);
-            const y2 = PIE_CENTER + PIE_RADIUS * Math.sin(endAngle);
-            const largeArcFlag = angle > Math.PI ? 1 : 0;
-
-            const pathData = [
-                `M ${PIE_CENTER} ${PIE_CENTER}`,
-                `L ${x1} ${y1}`,
-                `A ${PIE_RADIUS} ${PIE_RADIUS} 0 ${largeArcFlag} 1 ${x2} ${y2}`,
-                'Z'
-            ].join(' ');
-
-            segments.push({
-                ...protocol,
-                percentage: percentage * 100,
-                pathData
-            });
-
-            startAngle = endAngle;
-        });
-
-        return segments;
-    };
-
-    const segments = calculatePieSegments();
-
-    return (
-        <Card className="chart-card">
-            <CardHeader className="chart-card-header">
-                <h5>Protocol Distribution</h5>
-                <span className="chart-pill">{protocolData.totalCount} TOTAL</span>
-            </CardHeader>
-
-            <CardBody className="chart-card-body">
-                <div className="pie-stage">
-                    <svg className="pie-svg" viewBox="0 0 300 300" preserveAspectRatio="xMidYMid meet">
-                        {segments.map((segment) => (
-                            <path
-                                key={segment.name}
-                                d={segment.pathData}
-                                fill={segment.color}
-                                stroke="rgba(6, 20, 35, 0.9)"
-                                strokeWidth="2"
-                                opacity="0.96"
-                            />
-                        ))}
-
-                        <circle cx={PIE_CENTER} cy={PIE_CENTER} r="62" fill="rgba(10, 24, 41, 0.98)" stroke="rgba(95, 139, 184, 0.45)" strokeWidth="2" />
-
-                        <text x={PIE_CENTER} y="140" textAnchor="middle" fontSize="13" fill="#90abc7">
-                            Protocol Mix
-                        </text>
-                        <text x={PIE_CENTER} y="162" textAnchor="middle" fontSize="28" fontWeight="700" fill="#d7ecff">
-                            {protocolData.totalCount}
-                        </text>
-                        <text x={PIE_CENTER} y="179" textAnchor="middle" fontSize="11" fill="#90abc7">
-                            packets analyzed
-                        </text>
-                    </svg>
-                </div>
-
-                <div className="pie-summary-grid">
-                    {[
-                        { name: 'TCP', value: protocolData.TCP, color: '#20d8de' },
-                        { name: 'UDP', value: protocolData.UDP, color: '#41e28f' },
-                        { name: 'ICMP', value: protocolData.ICMP, color: '#ffbf47' },
-                        { name: 'Other', value: protocolData.Other, color: '#7e9cbd' }
-                    ].map((item) => {
-                        const percent = protocolData.totalCount ? ((item.value / protocolData.totalCount) * 100).toFixed(1) : '0.0';
-                        return (
-                            <div key={item.name} className="pie-summary-item" style={{ borderColor: `${item.color}66` }}>
-                                <span className="name" style={{ color: item.color }}>
-                                    {item.name}
-                                </span>
-                                <span className="value">{item.value}</span>
-                                <span className="pct">{percent}%</span>
-                            </div>
-                        );
-                    })}
-                </div>
-            </CardBody>
-        </Card>
-    );
+        {/* Legend */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 7 }}>
+          {PROTOCOLS.map(({ name, color }) => {
+            const v = data[name] || 0;
+            const pct = data.totalCount ? ((v / data.totalCount) * 100).toFixed(1) : '0.0';
+            return (
+              <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: color, flexShrink: 0 }} />
+                <span style={{ fontSize: '0.76rem', color: '#90abc7', flex: 1 }}>{name}</span>
+                <span style={{ fontSize: '0.76rem', fontWeight: 700, color: '#d7ecff' }}>{v}</span>
+                <span style={{ fontSize: '0.7rem', color: '#7e9cbd', minWidth: 38, textAlign: 'right' }}>{pct}%</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default ProtocolPieChart;

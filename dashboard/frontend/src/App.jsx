@@ -48,7 +48,7 @@ function LayoutWithSidebar() {
   return (
     <div style={{ display: 'flex', minHeight: '100vh' }}>
       <Header />
-      <main style={{ flex: 1, marginLeft: 0, minHeight: '100vh', transition: 'margin-left 0.25s' }}>
+      <main style={{ flex: 1, marginLeft: 'var(--sidebar-w, 220px)', minHeight: '100vh', transition: 'margin-left 0.25s cubic-bezier(0.4,0,0.2,1)', overflowX: 'hidden' }}>
         <Routes>
           <Route path="/"              element={<Navigate to="/dashboard" replace />} />
           <Route path="/dashboard"     element={<Dashboard />} />

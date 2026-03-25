@@ -1,7 +1,7 @@
 /* ── Sidebar Layout ──────────────────────────────────────────── */
 .sf-sidebar {
   position: fixed; left: 0; top: 0; bottom: 0; z-index: 100;
-  width: 220px;
+  width: var(--sidebar-w, 220px);
   background: linear-gradient(180deg, rgba(8,14,31,0.98) 0%, rgba(4,8,20,0.99) 100%);
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column;
@@ -9,7 +9,7 @@
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
 }
-.sf-sidebar.collapsed { width: 62px; }
+.sf-sidebar.collapsed { width: var(--sidebar-w-collapsed, 62px); }
 
 /* Logo */
 .sidebar-logo {
