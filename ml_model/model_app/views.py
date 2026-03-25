@@ -14,8 +14,11 @@ Fixes applied (2026-03-16):
   - Graceful startup: warns if models/scalers are missing (not yet trained).
 """
 
+import csv
+import io
 import json
 import logging
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -25,8 +28,16 @@ import numpy as np
 import pandas as pd
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
+
+# Local enrichment modules
+try:
+    from model_app import abuse_ipdb, incidents as incident_engine, simulate as sim
+    from model_app.models import AlertRecord
+except ImportError:
+    from . import abuse_ipdb, incidents as incident_engine, simulate as sim
+    from .models import AlertRecord
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +153,93 @@ else:
     _use_xgb  = False
     logger.info("→  XGBoost not available, falling back to Random Forest")
 
+# ── MITRE ATT&CK mapping ───────────────────────────────────────────────────────
+ATTACK_TO_MITRE: dict[str, dict] = {
+    'DoS':         {'id': 'T1498',     'name': 'Network Denial of Service',   'tactic': 'Impact'},
+    'DDoS':        {'id': 'T1498.001', 'name': 'Direct Network Flood',        'tactic': 'Impact'},
+    'PortScan':    {'id': 'T1046',     'name': 'Network Service Discovery',   'tactic': 'Discovery'},
+    'BruteForce':  {'id': 'T1110',     'name': 'Brute Force',                 'tactic': 'Credential Access'},
+    'Botnet':      {'id': 'T1071',     'name': 'Application Layer Protocol',  'tactic': 'Command & Control'},
+    'Infiltration':{'id': 'T1190',     'name': 'Exploit Public-Facing App',   'tactic': 'Initial Access'},
+    'Heartbleed':  {'id': 'T1203',     'name': 'Exploitation for Client Exec','tactic': 'Execution'},
+    'Anomaly':     {'id': 'T1499',     'name': 'Endpoint Denial of Service',  'tactic': 'Impact'},
+}
+
+# ── SHAP explainer (initialised after model load) ──────────────────────────────
+_shap_explainer = None
+
+def _init_shap():
+    global _shap_explainer
+    if rf is None:
+        return
+    try:
+        import shap
+        _shap_explainer = shap.TreeExplainer(rf)
+        logger.info('✓  SHAP TreeExplainer initialised')
+    except Exception as exc:
+        msg = str(exc)
+        if _use_xgb and "could not convert string to float" in msg:
+            logger.info('SHAP disabled for XGBoost model due SHAP/XGBoost compatibility: %s', msg)
+            return
+        logger.warning('SHAP init failed: %s', exc)
+
+# Initialise SHAP in background so startup stays fast
+threading.Thread(target=_init_shap, daemon=True).start()
+
+# ── Host Threat Scores ─────────────────────────────────────────────────────────
+# Rolling score per source IP.  Decays 2% every 60 s.
+_host_scores: dict[str, dict] = {}   # ip → {score, attacks, last_seen}
+_host_lock   = threading.Lock()
+_DECAY_FACTOR = 0.98
+_AUTO_BLOCK_THRESHOLD = 85.0
+
+def _update_host_score(src_ip: str, severity: str, attack_type: str):
+    delta = {'High': 30, 'Medium': 15, 'Low': 2}.get(severity, 2)
+    with _host_lock:
+        rec = _host_scores.setdefault(src_ip, {'score': 0.0, 'attacks': [], 'last_seen': 0})
+        rec['score']     = min(100.0, rec['score'] + delta)
+        rec['last_seen'] = time.time()
+        if attack_type not in rec['attacks']:
+            rec['attacks'].append(attack_type)
+        # Auto-block if score exceeds threshold
+        if rec['score'] >= _AUTO_BLOCK_THRESHOLD:
+            _block_ip_system(src_ip)
+
+def _decay_scores():
+    """Background task: decay all host scores every 60 s."""
+    while True:
+        time.sleep(60)
+        with _host_lock:
+            for ip in list(_host_scores):
+                _host_scores[ip]['score'] *= _DECAY_FACTOR
+                if _host_scores[ip]['score'] < 0.5:
+                    del _host_scores[ip]
+
+threading.Thread(target=_decay_scores, daemon=True).start()
+
+# ── IP Blocking ────────────────────────────────────────────────────────────────
+_blocked_ips: set[str] = set()
+_block_lock  = threading.Lock()
+
+def _block_ip_system(ip: str):
+    """Add a Windows Firewall inbound block rule for the given IP."""
+    if ip in ('unknown', '') or ip.startswith(('127.', '192.168.', '10.')):
+        return  # never block private/loopback
+    with _block_lock:
+        if ip in _blocked_ips:
+            return
+        try:
+            rule = f'SecureFlow_Block_{ip}'
+            subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                 f'name={rule}', 'dir=in', 'action=block', f'remoteip={ip}'],
+                capture_output=True, timeout=5
+            )
+            _blocked_ips.add(ip)
+            logger.info('Blocked IP via firewall: %s', ip)
+        except Exception as exc:
+            logger.warning('Firewall block failed for %s: %s', ip, exc)
+
 # ── In-memory flow table ───────────────────────────────────────────────────────
 flows      = {}
 flows_lock = threading.Lock()
@@ -153,6 +251,10 @@ processing_stats = {
     'avg_processing_time_ms': 0.0,
     'start_time':             time.time(),
 }
+
+# ── Recent alerts store (for export) ──────────────────────────────────────────
+_recent_alerts: list[dict] = []
+_MAX_RECENT    = 5000
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -458,9 +560,10 @@ def _predict_alerts(flow_items):
     frame = pd.DataFrame(feature_rows, columns=FEATURES).fillna(0.0)
 
     # ── Classifier inference — use the SAVED scaler (transform only, never fit) ─
-    X_rf    = scaler_rf.transform(frame)
-    rf_pred = rf.predict(X_rf)
-    rf_prob = rf.predict_proba(X_rf).max(axis=1) if hasattr(rf, 'predict_proba') else np.ones(len(flow_items))
+    X_rf       = scaler_rf.transform(frame)
+    rf_pred_raw = rf.predict(X_rf)
+    rf_pred    = rf_pred_raw.copy()
+    rf_prob    = rf.predict_proba(X_rf).max(axis=1) if hasattr(rf, 'predict_proba') else np.ones(len(flow_items))
 
     # XGBoost predicts integer class indices — decode back to string labels
     if _use_xgb and _xgb_encoder is not None:
@@ -476,17 +579,91 @@ def _predict_alerts(flow_items):
 
     alerts = []
     for idx, (fid, _) in enumerate(flow_items):
-        fused = fusion_engine(str(rf_pred[idx]), float(rf_prob[idx]), float(iso_scores[idx]))
-        alerts.append({
-            'final':     fused,
-            'protocol':  _protocol_label(fid[4]),
-            'src_ip':    fid[0],
-            'dst_ip':    fid[1],
-            'sport':     fid[2],
-            'dport':     fid[3],
-            'timestamp': time.time(),
-            'message':   f"Flow: {fused['attack_type']} ({fused['severity']})",
-        })
+        fused       = fusion_engine(str(rf_pred[idx]), float(rf_prob[idx]), float(iso_scores[idx]))
+        attack_type = fused['attack_type']
+        src_ip      = fid[0]
+
+        # ── MITRE ATT&CK ─────────────────────────────────────────────────────
+        mitre = ATTACK_TO_MITRE.get(attack_type, {})
+
+        # ── SHAP top-3 feature drivers (only for non-Normal alerts) ─────────
+        shap_top = []
+        if _shap_explainer is not None and attack_type.lower() != 'normal':
+            try:
+                sv = _shap_explainer.shap_values(X_rf[idx:idx+1])
+                # sv may be 2D (binary) or 3D (multi-class)
+                if isinstance(sv, list):
+                    pred_cls = int(rf_pred_raw[idx]) if _use_xgb else 0
+                    vals = sv[min(pred_cls, len(sv)-1)][0]
+                else:
+                    vals = sv[0]
+                top3_idx = np.argsort(np.abs(vals))[-3:][::-1]
+                shap_top = [
+                    {'feature': FEATURES[i].strip(), 'impact': round(float(vals[i]), 4)}
+                    for i in top3_idx if i < len(FEATURES)
+                ]
+            except Exception:
+                pass
+
+        # ── AbuseIPDB reputation ──────────────────────────────────────────────
+        abuse_score = abuse_ipdb.get_abuse_score(src_ip)
+
+        # ── Host threat score update ──────────────────────────────────────────
+        if attack_type.lower() != 'normal':
+            _update_host_score(src_ip, fused['severity'], attack_type)
+
+        alert = {
+            'final':       fused,
+            'protocol':    _protocol_label(fid[4]),
+            'src_ip':      src_ip,
+            'dst_ip':      fid[1],
+            'sport':       fid[2],
+            'dport':       fid[3],
+            'timestamp':   time.time(),
+            'mitre':       mitre,
+            'shap':        shap_top,
+            'abuse_score': abuse_score,
+            'abuse_badge': abuse_ipdb.badge(abuse_score),
+            'message':     f"Flow: {attack_type} ({fused['severity']})",
+        }
+
+        # ── Alert correlation → incident ──────────────────────────────────────
+        incident = incident_engine.correlate_alert(alert)
+        if incident:
+            alert['incident_id'] = incident['id']
+
+        alerts.append(alert)
+
+        # Store for export (in-memory ring buffer)
+        global _recent_alerts
+        _recent_alerts = (_recent_alerts + alerts)[-_MAX_RECENT:]
+
+        # ── Persist to database ───────────────────────────────────────────────
+        db_records = []
+        for a in alerts:
+            f = a.get('final', {})
+            m = a.get('mitre', {})
+            db_records.append(AlertRecord(
+                timestamp    = a.get('timestamp', time.time()),
+                src_ip       = (a.get('src_ip') or None),
+                dst_ip       = (a.get('dst_ip') or None),
+                sport        = (a.get('sport') or None),
+                dport        = (a.get('dport') or None),
+                protocol     = a.get('protocol', ''),
+                attack_type  = f.get('attack_type', ''),
+                severity     = f.get('severity', ''),
+                confidence   = float(f.get('final_score', 0.0)),
+                mitre_id     = m.get('id', ''),
+                mitre_tactic = m.get('tactic', ''),
+                abuse_score  = int(a.get('abuse_score', 0)),
+                incident_id  = str(a.get('incident_id', '')),
+                is_simulated = a.get('is_simulated', False),
+            ))
+        try:
+            AlertRecord.objects.bulk_create(db_records, ignore_conflicts=True)
+        except Exception as db_err:
+            logger.warning('DB write failed: %s', db_err)
+
 
     elapsed_ms = (time.time() - start) * 1000.0
     n = len(flow_items)
@@ -642,3 +819,322 @@ def predict_flow(request):
     except Exception as error:
         logger.exception('Error in predict_flow')
         return JsonResponse({'status': 'error', 'message': str(error)}, status=500)
+
+
+# ── Feature 4: Host Threat Scores ──────────────────────────────────────────────
+def get_host_scores(request):
+    with _host_lock:
+        hosts = [
+            {'ip': ip, 'score': round(rec['score'], 1),
+             'attacks': rec['attacks'], 'last_seen': rec['last_seen']}
+            for ip, rec in _host_scores.items()
+        ]
+    hosts.sort(key=lambda h: h['score'], reverse=True)
+    return JsonResponse({'hosts': hosts[:50]})
+
+
+# ── Feature 5: Incidents ────────────────────────────────────────────────────────
+def get_incidents(request):
+    return JsonResponse({'incidents': incident_engine.get_all_incidents()})
+
+
+# ── Feature 6: IP Blocking ─────────────────────────────────────────────────────
+@csrf_exempt
+def manage_blocked_ips(request):
+    if request.method == 'GET':
+        with _block_lock:
+            return JsonResponse({'blocked_ips': sorted(_blocked_ips)})
+
+    if request.method == 'POST':
+        try:
+            body = json.loads(request.body)
+            ip   = body.get('ip', '').strip()
+            if not ip:
+                return JsonResponse({'error': 'ip required'}, status=400)
+            _block_ip_system(ip)
+            return JsonResponse({'status': 'blocked', 'ip': ip})
+        except Exception as exc:
+            return JsonResponse({'error': str(exc)}, status=500)
+
+    if request.method == 'DELETE':
+        try:
+            body = json.loads(request.body)
+            ip   = body.get('ip', '').strip()
+            if not ip:
+                return JsonResponse({'error': 'ip required'}, status=400)
+            rule = f'SecureFlow_Block_{ip}'
+            subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={rule}'],
+                capture_output=True, timeout=5
+            )
+            with _block_lock:
+                _blocked_ips.discard(ip)
+            return JsonResponse({'status': 'unblocked', 'ip': ip})
+        except Exception as exc:
+            return JsonResponse({'error': str(exc)}, status=500)
+
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+
+# ── Feature 7: Attack Simulation ───────────────────────────────────────────────
+@csrf_exempt
+def simulate_attack(request):
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST only'}, status=405)
+    try:
+        body        = json.loads(request.body or '{}')
+        attack_type = body.get('attack_type', 'DoS')
+        if attack_type not in sim.SUPPORTED:
+            return JsonResponse({'error': f'Unknown type. Supported: {sim.SUPPORTED}'}, status=400)
+
+        packets = sim.generate_packets(attack_type)
+        # Tag simulated packets so they get marked is_simulated=True in DB
+        for p in packets:
+            p['is_simulated'] = True
+        alerts  = process_packet_batch(packets, force_flush=True)
+        resp = JsonResponse({
+            'status':         'ok',
+            'attack_type':    attack_type,
+            'packets_sent':   len(packets),
+            'alerts_emitted': len(alerts),
+            'model_labels':   list({a.get('final', {}).get('attack_type') for a in alerts}),
+        })
+        resp['Access-Control-Allow-Origin'] = '*'
+        return resp
+    except Exception as exc:
+        logger.exception('Simulation error')
+        return JsonResponse({'error': str(exc)}, status=500)
+
+
+# ── Feature 8: Export ──────────────────────────────────────────────────────────
+def export_alerts(request):
+    fmt    = request.GET.get('format', 'csv').lower()
+    limit  = min(int(request.GET.get('limit', 1000)), _MAX_RECENT)
+    alerts = _recent_alerts[-limit:]
+
+    if fmt == 'csv':
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['timestamp', 'src_ip', 'dst_ip', 'sport', 'dport',
+                         'protocol', 'attack_type', 'severity', 'confidence',
+                         'mitre_id', 'mitre_tactic', 'abuse_score'])
+        for a in alerts:
+            f = a.get('final', {})
+            m = a.get('mitre', {})
+            writer.writerow([
+                a.get('timestamp', ''), a.get('src_ip', ''), a.get('dst_ip', ''),
+                a.get('sport', ''),     a.get('dport', ''),  a.get('protocol', ''),
+                f.get('attack_type', ''), f.get('severity', ''), f.get('final_score', ''),
+                m.get('id', ''),        m.get('tactic', ''),    a.get('abuse_score', 0),
+            ])
+        resp = HttpResponse(output.getvalue(), content_type='text/csv')
+        resp['Content-Disposition'] = 'attachment; filename="secureflow_alerts.csv"'
+        return resp
+
+    if fmt == 'pdf':
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib import colors
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet
+
+            buf    = io.BytesIO()
+            doc    = SimpleDocTemplate(buf, pagesize=A4, leftMargin=30, rightMargin=30)
+            styles = getSampleStyleSheet()
+            story  = []
+
+            story.append(Paragraph('SecureFlow IDS — Alert Report', styles['Title']))
+            story.append(Paragraph(f'Generated: {time.strftime("%Y-%m-%d %H:%M:%S")}'    
+                                   f'  |  Total alerts: {len(alerts)}', styles['Normal']))
+            story.append(Spacer(1, 12))
+
+            headers = ['Time', 'Src IP', 'Attack', 'Severity', 'MITRE ID', 'Abuse']
+            rows    = [headers]
+            for a in alerts[-200:]:   # PDF: last 200 rows
+                f = a.get('final', {})
+                m = a.get('mitre', {})
+                rows.append([
+                    time.strftime('%H:%M:%S', time.localtime(a.get('timestamp', 0))),
+                    a.get('src_ip', ''),
+                    f.get('attack_type', ''),
+                    f.get('severity', ''),
+                    m.get('id', ''),
+                    str(a.get('abuse_score', 0)),
+                ])
+
+            t = Table(rows, repeatRows=1)
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1a1a2e')),
+                ('TEXTCOLOR',  (0,0), (-1,0), colors.white),
+                ('FONTSIZE',   (0,0), (-1,-1), 7),
+                ('GRID',       (0,0), (-1,-1), 0.5, colors.grey),
+                ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#f0f0f0')]),
+            ]))
+            story.append(t)
+            doc.build(story)
+            buf.seek(0)
+            resp = HttpResponse(buf.read(), content_type='application/pdf')
+            resp['Content-Disposition'] = 'attachment; filename="secureflow_report.pdf"'
+            return resp
+        except Exception as exc:
+            return JsonResponse({'error': f'PDF generation failed: {exc}'}, status=500)
+
+
+    return JsonResponse({'error': 'format must be csv or pdf'}, status=400)
+
+
+def _cors(response):
+    """Add CORS headers so browser can download blobs cross-origin."""
+    response['Access-Control-Allow-Origin']  = '*'
+    response['Access-Control-Allow-Headers'] = 'Content-Type'
+    response['Access-Control-Expose-Headers'] = 'Content-Disposition'
+    return response
+
+
+def export_alerts(request):
+    """Export recent alerts as CSV or PDF — with CORS headers for browser download."""
+    fmt    = request.GET.get('format', 'csv').lower()
+    limit  = min(int(request.GET.get('limit', 1000)), _MAX_RECENT)
+    alerts = _recent_alerts[-limit:]
+
+    if fmt == 'csv':
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['timestamp', 'src_ip', 'dst_ip', 'sport', 'dport',
+                         'protocol', 'attack_type', 'severity', 'confidence',
+                         'mitre_id', 'mitre_tactic', 'abuse_score', 'simulated'])
+        for a in alerts:
+            f = a.get('final', {})
+            m = a.get('mitre', {})
+            writer.writerow([
+                a.get('timestamp', ''),       a.get('src_ip', ''),     a.get('dst_ip', ''),
+                a.get('sport', ''),           a.get('dport', ''),      a.get('protocol', ''),
+                f.get('attack_type', ''),     f.get('severity', ''),   f.get('final_score', ''),
+                m.get('id', ''),              m.get('tactic', ''),     a.get('abuse_score', 0),
+                a.get('is_simulated', False),
+            ])
+        resp = HttpResponse(output.getvalue(), content_type='text/csv')
+        resp['Content-Disposition'] = 'attachment; filename="secureflow_alerts.csv"'
+        return _cors(resp)
+
+    if fmt == 'pdf':
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib import colors
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet
+
+            buf    = io.BytesIO()
+            doc    = SimpleDocTemplate(buf, pagesize=A4, leftMargin=30, rightMargin=30)
+            styles = getSampleStyleSheet()
+            story  = []
+
+            story.append(Paragraph('SecureFlow IDS — Alert Report', styles['Title']))
+            story.append(Paragraph(
+                f'Generated: {time.strftime("%Y-%m-%d %H:%M:%S")}  |  Total alerts: {len(alerts)}',
+                styles['Normal']))
+            story.append(Spacer(1, 12))
+
+            headers = ['Time', 'Src IP', 'Attack', 'Severity', 'MITRE ID', 'Abuse', 'Sim']
+            rows    = [headers]
+            for a in alerts[-200:]:
+                f = a.get('final', {})
+                m = a.get('mitre', {})
+                rows.append([
+                    time.strftime('%H:%M:%S', time.localtime(a.get('timestamp', 0))),
+                    str(a.get('src_ip', '')),
+                    str(f.get('attack_type', '')),
+                    str(f.get('severity', '')),
+                    str(m.get('id', '')),
+                    str(a.get('abuse_score', 0)),
+                    'Y' if a.get('is_simulated') else 'N',
+                ])
+
+            t = Table(rows, repeatRows=1)
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1a1a2e')),
+                ('TEXTCOLOR',  (0,0), (-1,0), colors.white),
+                ('FONTSIZE',   (0,0), (-1,-1), 7),
+                ('GRID',       (0,0), (-1,-1), 0.5, colors.grey),
+                ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#f0f0f0')]),
+            ]))
+            story.append(t)
+            doc.build(story)
+            buf.seek(0)
+            resp = HttpResponse(buf.read(), content_type='application/pdf')
+            resp['Content-Disposition'] = 'attachment; filename="secureflow_report.pdf"'
+            return _cors(resp)
+        except Exception as exc:
+            return JsonResponse({'error': f'PDF generation failed: {exc}'}, status=500)
+
+    return JsonResponse({'error': 'format must be csv or pdf'}, status=400)
+
+
+# ── DB Alert Management ────────────────────────────────────────────────────────
+def list_db_alerts(request):
+    """Return paginated DB-persisted alerts."""
+    page   = max(1, int(request.GET.get('page', 1)))
+    limit  = min(int(request.GET.get('limit', 50)), 200)
+    offset = (page - 1) * limit
+    qs     = AlertRecord.objects.all()[offset:offset + limit]
+    total  = AlertRecord.objects.count()
+    resp   = JsonResponse({'alerts': [a.to_dict() for a in qs], 'total': total, 'page': page, 'limit': limit})
+    return _cors(resp)
+
+
+@csrf_exempt
+def delete_db_alert(request, alert_id=None):
+    """DELETE /model_app/db_alerts/<id> — remove one alert. DELETE /model_app/db_alerts — clear all."""
+    if request.method not in ('DELETE', 'POST'):
+        return JsonResponse({'error': 'DELETE/POST only'}, status=405)
+    try:
+        if alert_id:
+            AlertRecord.objects.filter(pk=alert_id).delete()
+            return _cors(JsonResponse({'status': 'deleted', 'id': alert_id}))
+        else:
+            # Body may contain {"filter": "simulated"} or empty = delete all
+            body   = json.loads(request.body or '{}')
+            filt   = body.get('filter', 'all')
+            if filt == 'simulated':
+                n, _ = AlertRecord.objects.filter(is_simulated=True).delete()
+            elif filt == 'attack_type' and body.get('value'):
+                n, _ = AlertRecord.objects.filter(attack_type=body['value']).delete()
+            else:
+                n, _ = AlertRecord.objects.all().delete()
+            return _cors(JsonResponse({'status': 'cleared', 'deleted': n}))
+    except Exception as exc:
+        return JsonResponse({'error': str(exc)}, status=500)
+
+
+# ── Log Viewer ─────────────────────────────────────────────────────────────────
+def get_log_lines(request):
+    """Return last N lines of the Django/Daphne log file."""
+    from django.conf import settings
+    import pathlib
+
+    n        = min(int(request.GET.get('lines', 200)), 2000)
+    kind     = request.GET.get('kind', 'ids')   # ids | django
+
+    # Try common log locations
+    candidates = [
+        pathlib.Path(settings.BASE_DIR).parent / 'logs' / f'{kind}.log',
+        pathlib.Path(settings.BASE_DIR).parent / f'{kind}.log',
+        pathlib.Path(settings.BASE_DIR) / 'logs' / f'{kind}.log',
+    ]
+    log_path = next((p for p in candidates if p.exists()), None)
+
+    if log_path is None:
+        # Fall back to Python logging memory handler or return placeholder
+        return _cors(JsonResponse({
+            'lines': ['[LOG FILE NOT FOUND] Configure LOGGING in settings.py to write to a file.',
+                      'Expected location: <project_root>/logs/ids.log'],
+            'path': str(candidates[0]),
+        }))
+
+    try:
+        with open(log_path, 'r', errors='replace') as f:
+            all_lines = f.readlines()
+        lines = [l.rstrip() for l in all_lines[-n:]]
+        return _cors(JsonResponse({'lines': lines, 'path': str(log_path), 'total': len(all_lines)}))
+    except Exception as exc:
+        return _cors(JsonResponse({'lines': [f'Error reading log: {exc}'], 'path': str(log_path)}))

@@ -38,7 +38,7 @@ function App() {
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
           <Route path="/dashboard" element={<Dashboard />} />
-          <Route path="/traffic" element={<RealTimeTraffic />} />
+          <Route path="/traffic"   element={<RealTimeTraffic />} />
           <Route path="/blocked-ips" element={<BlockedIPs />} />
           <Route path="/analytics" element={<AttackAnalytics />} />
           {/* <Route path="/profile" element={<Profile />} />

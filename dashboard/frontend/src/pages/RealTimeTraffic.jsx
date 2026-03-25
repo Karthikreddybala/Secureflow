@@ -1,9 +1,12 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
 import './css/traffic.css';
 import LiveTrafficTable from '../charts/livetrafic';
 import ConnectionStatus from '../components/ConnectionStatus.jsx';
 import { pauseNetworkData, resumeNetworkData, clearNetworkData } from '../store/slices/networkDataSlice';
+
+const API = 'http://127.0.0.1:8000/model_app'
+const SIM_TYPES = ['DoS', 'DDoS', 'PortScan', 'BruteForce', 'Botnet', 'Normal']
 
 function RealTimeTraffic() {
   const dispatch = useDispatch();
@@ -11,6 +14,23 @@ function RealTimeTraffic() {
   const isPaused = useSelector((state) => state.networkData.isPaused);
   const packetCount = useSelector((state) => state.networkData.packetCount);
   const lastNetworkTime = useSelector((state) => state.networkData.lastNetworkTime);
+  const [simType, setSimType]     = useState('DoS')
+  const [simState, setSimState]   = useState('idle')  // idle | running | done
+  const [simResult, setSimResult] = useState(null)
+
+  const simulate = async () => {
+    setSimState('running')
+    try {
+      const r = await fetch(`${API}/simulate`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ attack_type: simType }),
+      })
+      const d = await r.json()
+      setSimResult(d)
+    } catch { setSimResult({ error: 'Connection failed' }) }
+    setSimState('done')
+    setTimeout(() => setSimState('idle'), 4000)
+  }
 
   const protocolSummary = useMemo(() => {
     return networkData.reduce(
@@ -134,6 +154,38 @@ function RealTimeTraffic() {
               <div className="traffic-intensity-fill" style={{ width: `${trafficIntensity}%` }} />
             </div>
             <p className="traffic-intensity-note">Relative density of current visible packets vs cumulative ingestion.</p>
+          </section>
+
+          <section className="traffic-side-panel cyber-panel">
+            <div className="cyber-panel-header">
+              <h3 className="cyber-panel-title">⚡ Attack Simulation</h3>
+              <span className="cyber-pill">Demo</span>
+            </div>
+            <p style={{ color: '#8b949e', fontSize: '0.8rem', marginBottom: '10px' }}>
+              Inject synthetic attacks into the live detection pipeline.
+            </p>
+            <select
+              value={simType}
+              onChange={e => setSimType(e.target.value)}
+              style={{ width: '100%', background: '#0d1117', border: '1px solid #30363d', color: '#fff',
+                       padding: '6px 10px', borderRadius: '6px', marginBottom: '8px' }}>
+              {SIM_TYPES.map(t => <option key={t}>{t}</option>)}
+            </select>
+            <button
+              onClick={simulate}
+              disabled={simState === 'running'}
+              style={{ width: '100%', background: 'linear-gradient(135deg,#e91e63,#ff4444)',
+                       border: 'none', color: '#fff', padding: '8px', borderRadius: '6px',
+                       fontWeight: '700', cursor: 'pointer', opacity: simState === 'running' ? 0.6 : 1 }}>
+              {simState === 'running' ? '⏳ Simulating…' : simState === 'done' ? '✅ Done' : '⚡ Simulate'}
+            </button>
+            {simResult && simState === 'done' && (
+              <p style={{ color: '#4caf50', fontSize: '0.8rem', marginTop: '6px' }}>
+                {simResult.error
+                  ? `❌ ${simResult.error}`
+                  : `✅ ${simResult.packets_sent} pkts → ${simResult.alerts_emitted} alerts`}
+              </p>
+            )}
           </section>
 
           <ConnectionStatus compact />

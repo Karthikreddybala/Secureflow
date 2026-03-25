@@ -131,3 +131,22 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Incident Timeline embedded section */
+.attack-incidents {
+  margin-top: 16px;
+}
+.inc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.inc-embed-card {
+  background: rgba(9,24,42,0.82);
+  border: 1px solid rgba(88,136,188,0.35);
+  border-radius: 8px;
+  padding: 12px 14px;
+  transition: transform 0.15s;
+}
+.inc-embed-card:hover { transform: translateY(-1px); }
