@@ -1,51 +1,156 @@
+"""
+SecureFlow — engine/pp.py
+Dual-interface packet capture: laptop Wi-Fi + Windows Mobile Hotspot adapter.
+
+Auto-detects:
+  • Primary Wi-Fi  → interface with a real routable IP (192.168.x / 10.x / 172.x)
+  • Hotspot adapter → MediaTek Wi-Fi card #2/#3/… OR any interface whose IP
+                      is in the Windows hotspot subnet (192.168.137.x / 169.254.x
+                      with no default-route IP on same adapter)
+
+Both sniffers push into the same thread-safe queue → same WebSocket pipeline →
+same Django ML engine.  No changes needed in views.py.
+"""
+
 import asyncio
-import websockets
 import json
-import time
 import logging
 import queue
-from scapy.all import sniff, PcapReader
-from scapy.all import IP, TCP, UDP
+import re
+import subprocess
 import sys
+import threading
+import time
 
+import websockets
+from scapy.all import IP, TCP, UDP, PcapReader, sniff
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 logger = logging.getLogger(__name__)
 
+# ── WebSocket endpoint ─────────────────────────────────────────────────────────
 WS_SERVER = "ws://127.0.0.1:8000/ws/packets/"
 
+# ── Batch settings ─────────────────────────────────────────────────────────────
 PACKET_BATCH_SIZE = 100
-PACKET_BATCH_TIME = 0.5  # seconds
+PACKET_BATCH_TIME = 0.5   # seconds
 
-# Global variables
-packet_batch = []
-last_send = time.time()
-ws_connection = None
-ws_lock = asyncio.Lock()
-shutdown_event = asyncio.Event()
+# ── Globals ────────────────────────────────────────────────────────────────────
+packet_batch: list  = []
+last_send           = time.time()
+packet_queue        = queue.Queue(maxsize=5000)
 
-# Thread-safe packet queue for communication between threads
-packet_queue = queue.Queue(maxsize=5000)
-packet_processing_task = None
+# ── Interface auto-detection ───────────────────────────────────────────────────
+# Subnets that indicate a REAL internet-facing adapter
+_ROUTABLE_RE = re.compile(
+    r"^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.(?!137\.))"
+)
+# Windows Mobile Hotspot default subnet
+_HOTSPOT_RE = re.compile(r"^192\.168\.137\.")
 
+
+def _get_all_ifaces() -> list[dict]:
+    """Return Scapy's Windows interface list (graceful fallback)."""
+    try:
+        from scapy.arch.windows import get_windows_if_list
+        return get_windows_if_list()
+    except Exception as exc:
+        logger.warning("Cannot enumerate interfaces via Scapy: %s", exc)
+        return []
+
+
+def _detect_interfaces() -> tuple[str | None, str | None]:
+    """
+    Returns (wifi_iface, hotspot_iface) — either may be None.
+
+    Strategy
+    --------
+    1. Walk all interfaces that have at least one assigned IP.
+    2. Primary Wi-Fi  = first interface whose IPs include a routable private
+                        address AND whose description contains "Wi-Fi 7" /
+                        "Wireless" (prefers the laptop's own connection).
+    3. Hotspot        = interface whose description marks it as virtual card #2
+                        (Windows always creates a numbered clone for hotspot).
+                        Fall back to 192.168.137.x subnet detection.
+    """
+    ifaces = _get_all_ifaces()
+
+    wifi_iface    : str | None = None
+    hotspot_iface : str | None = None
+
+    # ── Pass 1: find the primary (routable) Wi-Fi adapter ─────────────────────
+    for iface in ifaces:
+        name = iface.get("name", "")
+        desc = iface.get("description", "").lower()
+        ips  = iface.get("ips", [])
+
+        # Skip filter-driver clones (they have '-' in the name after base name)
+        if re.search(r"-(WFP|Npcap|QoS|Native|Virtual)", name):
+            continue
+
+        has_routable = any(_ROUTABLE_RE.match(ip) for ip in ips)
+
+        if has_routable and ("wi-fi" in desc or "wireless" in desc):
+            # Prefer the one that looks like the base card (no #N suffix)
+            if "#" not in desc:
+                wifi_iface = name
+                break           # exact match — stop searching
+            elif wifi_iface is None:
+                wifi_iface = name   # keep as fallback
+
+    # ── Pass 2: find the hotspot / virtual adapter ─────────────────────────────
+    for iface in ifaces:
+        name = iface.get("name", "")
+        desc = iface.get("description", "").lower()
+        ips  = iface.get("ips", [])
+
+        if re.search(r"-(WFP|Npcap|QoS|Native|Virtual)", name):
+            continue
+        if name == wifi_iface:
+            continue
+
+        # Condition A: MediaTek virtual card with a numeric suffix (#2, #3 …)
+        is_virtual_card = bool(
+            re.search(r"wi-fi 7.*#\d+|wireless lan card #\d+", desc)
+        )
+        # Condition B: IP in the hotspot subnet
+        has_hotspot_ip = any(_HOTSPOT_RE.match(ip) for ip in ips)
+        # Condition C: "wi-fi direct" or "hosted network" in description
+        is_hotspot_desc = any(
+            kw in desc for kw in ("wi-fi direct", "hosted network", "microsoft wifi direct")
+        )
+
+        if has_hotspot_ip or is_hotspot_desc or (
+            is_virtual_card and name != wifi_iface
+        ):
+            hotspot_iface = name
+            break
+
+    return wifi_iface, hotspot_iface
+
+
+# ── PacketProcessor ────────────────────────────────────────────────────────────
 class PacketProcessor:
     def __init__(self):
-        self.ws_connection = None
-        self.ws_lock = asyncio.Lock()
-        self.shutdown_event = asyncio.Event()
-        self.reconnect_attempts = 0
-        self.max_reconnect_attempts = None
-        self.heartbeat_interval = 10  # seconds
-        self.connection_state = "disconnected"  # disconnected, connecting, connected, reconnecting
-        self.last_connection_attempt = 0
-        self.min_reconnect_delay = 1  # Minimum delay between reconnection attempts
-        self.max_reconnect_delay = 15  # Maximum delay between reconnection attempts
-        self.main_event_loop = None  # Store reference to main event loop
-        self.packet_processing_enabled = True  # Control packet processing
-        
+        self.ws_connection   = None
+        self.ws_lock         = asyncio.Lock()
+        self.shutdown_event  = asyncio.Event()
+        self.reconnect_attempts      = 0
+        self.max_reconnect_attempts  = None
+        self.heartbeat_interval      = 10
+        self.connection_state        = "disconnected"
+        self.last_connection_attempt = 0.0
+        self.min_reconnect_delay     = 1
+        self.max_reconnect_delay     = 15
+        self.main_event_loop         = None
+        self.packet_processing_enabled = True
+
+    # ── WebSocket helpers ──────────────────────────────────────────────────────
     async def connect_ws(self):
-        """Establish WebSocket connection with retry logic"""
         current_attempt = 0
         self.connection_state = "connecting"
 
@@ -53,344 +158,325 @@ class PacketProcessor:
             current_attempt += 1
             try:
                 self.last_connection_attempt = time.time()
-                logger.info(f"Connecting to WebSocket server: {WS_SERVER} (attempt {current_attempt})")
+                logger.info("Connecting to %s (attempt %d)", WS_SERVER, current_attempt)
                 self.ws_connection = await websockets.connect(
                     WS_SERVER,
-                    ping_interval=20,  # Send ping every 20 seconds
-                    ping_timeout=20,   # Wait 20 seconds for pong
-                    close_timeout=10   # Wait 10 seconds for close handshake
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=10,
                 )
-                logger.info("Successfully connected to WebSocket server")
-                self.connection_state = "connected"
-                self.reconnect_attempts = 0  # Reset retry count on success
+                logger.info("Connected to WebSocket server")
+                self.connection_state    = "connected"
+                self.reconnect_attempts  = 0
                 return True
-            except Exception as e:
+            except Exception as exc:
                 self.reconnect_attempts += 1
-                wait_time = min(self.min_reconnect_delay * (2 ** min(current_attempt - 1, 5)), self.max_reconnect_delay)
-                logger.error(f"WebSocket connection failed (attempt {current_attempt}): {e}")
-                logger.info(f"Retrying connection in {wait_time} seconds...")
-                await asyncio.sleep(wait_time)
+                wait = min(
+                    self.min_reconnect_delay * (2 ** min(current_attempt - 1, 5)),
+                    self.max_reconnect_delay,
+                )
+                logger.error("WS connect failed (attempt %d): %s", current_attempt, exc)
+                logger.info("Retrying in %.1f s …", wait)
+                await asyncio.sleep(wait)
 
         self.connection_state = "disconnected"
         return False
 
     async def disconnect_ws(self):
-        """Safely disconnect WebSocket"""
         if self.ws_connection:
             try:
                 await self.ws_connection.close()
-                logger.info("WebSocket connection closed")
-            except Exception as e:
-                logger.error(f"Error closing WebSocket: {e}")
+                logger.info("WebSocket closed")
+            except Exception as exc:
+                logger.error("WS close error: %s", exc)
             finally:
                 self.ws_connection = None
 
     async def send_packet_batch(self):
-        """Send packet batch with error handling and reconnection"""
         global packet_batch
-        
         if not packet_batch:
             return
 
         async with self.ws_lock:
-            # Check connection state before attempting to send
             if self.connection_state != "connected" or not self.ws_connection:
-                logger.warning(f"WebSocket not connected (state: {self.connection_state}), attempting to reconnect...")
+                logger.warning("WS not connected (%s), reconnecting …", self.connection_state)
                 if not await self.connect_ws():
-                    logger.error("Failed to reconnect, keeping packet batch for retry")
+                    logger.error("Reconnect failed — keeping batch for retry")
                     return
 
             try:
-                # Validate event loop is still running before sending
-                current_loop = asyncio.get_running_loop()
-                if not current_loop or not current_loop.is_running():
-                    logger.error("Event loop is not running, cannot send packets")
-                    self.ws_connection = None
+                loop = asyncio.get_running_loop()
+                if not loop or not loop.is_running():
+                    logger.error("Event loop gone — cannot send packets")
+                    self.ws_connection    = None
                     self.connection_state = "disconnected"
                     return
 
-                await self.ws_connection.send(json.dumps({
-                    "packets": packet_batch
-                }))
-                logger.debug(f"Sent batch: {len(packet_batch)} packets")
+                await self.ws_connection.send(json.dumps({"packets": packet_batch}))
+                logger.debug("Sent batch: %d packets", len(packet_batch))
                 packet_batch = []
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.error(f"WebSocket connection closed: {e}")
-                self.ws_connection = None
+
+            except websockets.exceptions.ConnectionClosed as exc:
+                logger.error("WS connection closed: %s", exc)
+                self.ws_connection    = None
                 self.connection_state = "disconnected"
-                # Keep current batch intact; next cycle will reconnect and retry.
-                return
-            except RuntimeError as e:
-                if "Event loop is closed" in str(e):
-                    logger.critical("Event loop has been closed - this indicates a serious issue")
-                    logger.critical("Shutting down packet processor to prevent further corruption")
+            except RuntimeError as exc:
+                if "Event loop is closed" in str(exc):
+                    logger.critical("Event loop closed — shutting down processor")
                     self.packet_processing_enabled = False
                     self.shutdown_event.set()
-                    return
                 else:
-                    logger.error(f"RuntimeError in send_packet_batch: {e}")
-                    self.ws_connection = None
+                    logger.error("RuntimeError in send_packet_batch: %s", exc)
+                    self.ws_connection    = None
                     self.connection_state = "disconnected"
-            except Exception as e:
-                logger.error(f"WebSocket send error: {e}")
-                self.ws_connection = None
+            except Exception as exc:
+                logger.error("WS send error: %s", exc)
+                self.ws_connection    = None
                 self.connection_state = "disconnected"
 
     async def heartbeat(self):
-        """Send periodic heartbeat to keep connection alive"""
         while not self.shutdown_event.is_set():
             try:
                 await asyncio.sleep(self.heartbeat_interval)
                 if self.ws_connection:
                     await self.ws_connection.ping()
-                    logger.debug("Sent WebSocket heartbeat")
+                    logger.debug("WS heartbeat sent")
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("Heartbeat failed: connection closed")
-                self.ws_connection = None
+                self.ws_connection    = None
                 self.connection_state = "disconnected"
-            except Exception as e:
-                logger.error(f"Heartbeat failed: {e}")
+            except Exception as exc:
+                logger.error("Heartbeat error: %s", exc)
                 self.connection_state = "disconnected"
 
-    def get_connection_status(self):
-        """Get current connection status for monitoring"""
+    def get_connection_status(self) -> dict:
         return {
-            "state": self.connection_state,
+            "state":              self.connection_state,
             "reconnect_attempts": self.reconnect_attempts,
-            "max_reconnect_attempts": self.max_reconnect_attempts,
-            "last_connection_attempt": self.last_connection_attempt,
-            "has_connection": self.ws_connection is not None,
-            "batch_size": len(packet_batch)
+            "has_connection":     self.ws_connection is not None,
+            "batch_size":         len(packet_batch),
         }
 
-    def add_packet(self, pkt):
-        """Extract rich packet fields from Scapy object and add to batch."""
+    # ── Packet extraction ──────────────────────────────────────────────────────
+    def add_packet(self, pkt, source_iface: str = ""):
+        """Extract rich fields from a Scapy packet and append to the batch."""
         global packet_batch
-
         try:
-            # ── IP layer ──────────────────────────────────────────────────────
-            has_ip = IP in pkt
-            src        = pkt[IP].src   if has_ip else "unknown"
-            dst        = pkt[IP].dst   if has_ip else "unknown"
-            proto      = pkt[IP].proto if has_ip else 0
-            ip_hdr_len = pkt[IP].ihl * 4 if has_ip else 0   # bytes
+            has_ip    = IP in pkt
+            src       = pkt[IP].src   if has_ip else "unknown"
+            dst       = pkt[IP].dst   if has_ip else "unknown"
+            proto     = pkt[IP].proto if has_ip else 0
+            ip_hdr    = pkt[IP].ihl * 4 if has_ip else 0
 
-            # ── Transport layer ───────────────────────────────────────────────
-            sport = int(pkt.sport) if hasattr(pkt, 'sport') else 0
-            dport = int(pkt.dport) if hasattr(pkt, 'dport') else 0
+            sport     = int(pkt.sport) if hasattr(pkt, "sport") else 0
+            dport     = int(pkt.dport) if hasattr(pkt, "dport") else 0
 
-            # ── TCP-specific ──────────────────────────────────────────────────
-            # Flag bits: FIN=0x01  SYN=0x02  RST=0x04  PSH=0x08  ACK=0x10  URG=0x20
-            has_tcp    = TCP in pkt
-            tcp_flags  = int(pkt[TCP].flags)      if has_tcp else 0
-            tcp_hdr_len = pkt[TCP].dataofs * 4    if has_tcp else 0  # bytes
+            has_tcp   = TCP in pkt
+            tcp_flags = int(pkt[TCP].flags)   if has_tcp else 0
+            tcp_hdr   = pkt[TCP].dataofs * 4  if has_tcp else 0
 
             packet_info = {
-                "timestamp":   time.time(),
-                "src":         src,
-                "dst":         dst,
-                "sport":       sport,
-                "dport":       dport,
-                "proto":       proto,
-                "size":        len(pkt),
-                "ip_hdr_len":  ip_hdr_len,    # for Fwd/Bwd Header Length
-                "tcp_hdr_len": tcp_hdr_len,   # for Fwd/Bwd Header Length
-                "flags":       tcp_flags,     # raw TCP flags bitmask
+                "timestamp":    time.time(),
+                "src":          src,
+                "dst":          dst,
+                "sport":        sport,
+                "dport":        dport,
+                "proto":        proto,
+                "size":         len(pkt),
+                "ip_hdr_len":   ip_hdr,
+                "tcp_hdr_len":  tcp_hdr,
+                "flags":        tcp_flags,
+                "source_iface": source_iface,   # tag: "wifi" | "hotspot"
             }
             packet_batch.append(packet_info)
-        except Exception as e:
-            logger.error(f"Error processing packet: {e}")
+        except Exception as exc:
+            logger.error("Packet extraction error: %s", exc)
 
-
-    async def process_packet(self, pkt):
-        """Process individual packet and manage batching"""
+    async def process_packet(self, pkt, source_iface: str = ""):
         global last_send
-        
-        self.add_packet(pkt)
+        self.add_packet(pkt, source_iface)
         now = time.time()
-
-        # Check if we should send batch (size or time threshold)
-        should_send = (
-            len(packet_batch) >= PACKET_BATCH_SIZE or 
-            now - last_send > PACKET_BATCH_TIME
-        )
-
-        if should_send:
+        if len(packet_batch) >= PACKET_BATCH_SIZE or now - last_send > PACKET_BATCH_TIME:
             await self.send_packet_batch()
             last_send = now
 
-    def packet_callback(self, pkt):
-        """Scapy callback function for packet capture - Thread-safe version"""
-        # Add packet to queue for processing by main event loop
-        if not self.shutdown_event.is_set():
-            try:
-                # Put packet in queue for main event loop to process
-                packet_queue.put_nowait(pkt)
-                logger.debug("Packet added to processing queue")
-            except queue.Full:
-                logger.warning("Packet queue is full, dropping packet")
-            except Exception as e:
-                logger.error(f"Error adding packet to queue: {e}")
+    def packet_callback(self, pkt, source_iface: str = ""):
+        """Scapy callback — thread-safe: routes into the async queue."""
+        if self.shutdown_event.is_set():
+            return
+        try:
+            packet_queue.put_nowait((pkt, source_iface))
+        except queue.Full:
+            logger.warning("Packet queue full — dropping packet from %s", source_iface)
+        except Exception as exc:
+            logger.error("queue.put error: %s", exc)
 
     async def process_packets_from_queue(self):
-        """Process packets from the queue in the main event loop"""
+        """Drain the shared queue in the async event loop."""
         while not self.shutdown_event.is_set():
             try:
-                # Avoid blocking the async loop with Queue.get from a worker thread.
-                pkt = await asyncio.to_thread(packet_queue.get, True, 1)
-                
-                # Process the packet
-                await self.process_packet(pkt)
-                
-                # Mark task as done
+                pkt, source_iface = await asyncio.to_thread(packet_queue.get, True, 1.0)
+                await self.process_packet(pkt, source_iface)
                 packet_queue.task_done()
-                
             except queue.Empty:
-                # No packets in queue, continue loop
                 continue
-            except Exception as e:
-                logger.error(f"Error processing packet from queue: {e}")
+            except Exception as exc:
+                logger.error("Queue processing error: %s", exc)
 
-    async def start_capture(self, interface="Wi-Fi"):
-        """Start packet capture with graceful shutdown support"""
-        logger.info(f"Starting packet capture on interface: {interface}")
-        self.main_event_loop = asyncio.get_running_loop()
-        
-        # Start heartbeat task
-        heartbeat_task = asyncio.create_task(self.heartbeat())
-        
-        # Start packet processing task
-        packet_processing_task = asyncio.create_task(self.process_packets_from_queue())
-        
-        try:
-            # Start packet capture in a separate thread
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._run_sniff, interface)
-        except KeyboardInterrupt:
-            logger.info("Packet capture interrupted by user")
-        except Exception as e:
-            logger.error(f"Error in packet capture: {e}")
-        finally:
-            # Cancel tasks
-            heartbeat_task.cancel()
-            packet_processing_task.cancel()
-            
-            try:
-                await heartbeat_task
-                await packet_processing_task
-            except asyncio.CancelledError:
-                pass
-
-    def _run_sniff(self, interface):
-        """Run scapy sniff in executor to avoid blocking"""
+    # ── Sniffer threads ────────────────────────────────────────────────────────
+    def _run_sniff(self, interface: str, label: str):
+        """Run a blocking Scapy sniff in a thread-pool executor thread."""
+        logger.info("🔍 Sniffer started  →  %s  (%s)", interface, label)
         try:
             sniff(
                 iface=interface,
                 store=False,
-                prn=self.packet_callback,
-                stop_filter=lambda x: self.shutdown_event.is_set()
+                prn=lambda pkt: self.packet_callback(pkt, label),
+                stop_filter=lambda _: self.shutdown_event.is_set(),
             )
-        except Exception as e:
-            logger.error(f"Error in sniff thread: {e}")
+        except Exception as exc:
+            logger.error("Sniffer error on %s (%s): %s", interface, label, exc)
+        finally:
+            logger.info("🛑 Sniffer stopped  →  %s  (%s)", interface, label)
 
+    async def start_multi_capture(self, interfaces: list[tuple[str, str]]):
+        """
+        Start one sniffer thread per (interface_name, label) pair.
+        All sniffers share the same packet_queue.
+
+        Parameters
+        ----------
+        interfaces : list of (name, label)
+            e.g. [("Wi-Fi", "wifi"), ("Wi-Fi 2", "hotspot")]
+        """
+        self.main_event_loop = asyncio.get_running_loop()
+
+        heartbeat_task = asyncio.create_task(self.heartbeat())
+        queue_task     = asyncio.create_task(self.process_packets_from_queue())
+
+        loop = asyncio.get_event_loop()
+
+        # Launch one sniffer per interface (each in its own executor thread)
+        sniffer_tasks = [
+            loop.run_in_executor(None, self._run_sniff, name, label)
+            for name, label in interfaces
+        ]
+
+        try:
+            # Wait for all sniffers (they run until shutdown_event is set)
+            await asyncio.gather(*sniffer_tasks)
+        except KeyboardInterrupt:
+            logger.info("Capture interrupted by user")
+        except Exception as exc:
+            logger.error("Capture error: %s", exc)
+        finally:
+            heartbeat_task.cancel()
+            queue_task.cancel()
+            try:
+                await heartbeat_task
+                await queue_task
+            except asyncio.CancelledError:
+                pass
+
+    # ── PCAP replay ────────────────────────────────────────────────────────────
+    async def replay_pcap(self, pcap_file: str):
+        logger.info("▶  PCAP replay: %s", pcap_file)
+        prev_time    = None
+        packet_count = 0
+        try:
+            for pkt in PcapReader(pcap_file):
+                if self.shutdown_event.is_set():
+                    break
+                if prev_time is not None:
+                    delay = float(pkt.time) - prev_time
+                    if delay > 0:
+                        await asyncio.sleep(min(delay, 0.05))
+                prev_time = float(pkt.time)
+                packet_count += 1
+                try:
+                    packet_queue.put_nowait((pkt, "pcap"))
+                except queue.Full:
+                    logger.warning("Queue full during PCAP replay — dropping")
+            logger.info("PCAP replay complete. Packets: %d", packet_count)
+        except Exception as exc:
+            logger.error("PCAP replay error: %s", exc)
+
+    # ── Shutdown ───────────────────────────────────────────────────────────────
     async def shutdown(self):
-        """Graceful shutdown"""
-        logger.info("Shutting down packet processor...")
+        logger.info("Shutting down …")
         self.shutdown_event.set()
         await self.disconnect_ws()
 
 
-
-    async def replay_pcap(self, pcap_file):
-        """Replay packets from a PCAP file and feed them into the same processing pipeline"""
-        
-        logger.info(f"Starting PCAP replay: {pcap_file}")
-
-        prev_time = None
-        packet_count = 0
-
-        try:
-            for pkt in PcapReader(pcap_file):
-
-                if self.shutdown_event.is_set():
-                    break
-
-                # simulate realistic timing
-                if prev_time is not None:
-                    delay = pkt.time - prev_time
-                    if delay > 0:
-                        await asyncio.sleep(min(delay, 0.05))
-
-                prev_time = pkt.time
-                packet_count += 1
-
-                try:
-                    packet_queue.put_nowait(pkt)
-                except queue.Full:
-                    logger.warning("Packet queue full during PCAP replay, dropping packet")
-
-            logger.info(f"Finished PCAP replay. Packets processed: {packet_count}")
-
-        except Exception as e:
-            logger.error(f"Error during PCAP replay: {e}")
-
-
+# ── Main ───────────────────────────────────────────────────────────────────────
 async def main():
-    """Main function with proper error handling and shutdown"""
     processor = PacketProcessor()
-    
+
+    # ── Connect WebSocket first ────────────────────────────────────────────────
+    if not await processor.connect_ws():
+        logger.error("Cannot connect to Django WebSocket — is the server running?")
+        return
+
+    # Start the queue-to-WS pipeline even during PCAP replay
+    asyncio.create_task(processor.process_packets_from_queue())
+
+    # ── PCAP replay mode ───────────────────────────────────────────────────────
+    if len(sys.argv) > 1:
+        logger.info("PCAP mode — replaying: %s", sys.argv[1])
+        await processor.replay_pcap(sys.argv[1])
+        await processor.shutdown()
+        return
+
+    # ── Live capture mode ──────────────────────────────────────────────────────
+    wifi_iface, hotspot_iface = _detect_interfaces()
+
+    # Build interface list
+    interfaces: list[tuple[str, str]] = []
+
+    if wifi_iface:
+        interfaces.append((wifi_iface, "wifi"))
+        logger.info("✓  Primary Wi-Fi interface   → %s", wifi_iface)
+    else:
+        # Hard fallback
+        logger.warning("Could not auto-detect Wi-Fi interface — falling back to 'Wi-Fi'")
+        interfaces.append(("Wi-Fi", "wifi"))
+
+    if hotspot_iface:
+        interfaces.append((hotspot_iface, "hotspot"))
+        logger.info("✓  Hotspot interface         → %s", hotspot_iface)
+    else:
+        logger.warning(
+            "Hotspot adapter NOT detected — capturing laptop traffic only.\n"
+            "  Enable Mobile Hotspot (Settings → Network & Internet → Mobile Hotspot)\n"
+            "  then restart pp.py to also monitor hotspot clients."
+        )
+
+    if not interfaces:
+        logger.error("No usable interfaces found — exiting.")
+        await processor.shutdown()
+        return
+
+    logger.info("=" * 60)
+    logger.info("SecureFlow dual-capture starting on %d interface(s):", len(interfaces))
+    for name, label in interfaces:
+        logger.info("  [%s]  %s", label.upper().ljust(7), name)
+    logger.info("=" * 60)
+
     try:
-        # Connect to WebSocket
-        if not await processor.connect_ws():
-            logger.error("Failed to connect to WebSocket server")
-            return
-
-        # Start queue processor
-        asyncio.create_task(processor.process_packets_from_queue())
-
-        # PCAP replay mode
-        if len(sys.argv) > 1:
-            print("Replaying packets from PCAP file:", sys.argv[1])
-            pcap_file = sys.argv[1]
-            await processor.replay_pcap(pcap_file)
-
-        # Live capture mode
-        else:
-            await processor.start_capture("Wi-Fi")
-        
+        await processor.start_multi_capture(interfaces)
     except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt")
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.info("Keyboard interrupt received")
+    except Exception as exc:
+        logger.error("Fatal capture error: %s", exc)
     finally:
         await processor.shutdown()
 
-# async def main():
-#     """Main function with proper error handling and shutdown"""
-#     processor = PacketProcessor()
-    
-#     try:
-#         # Connect to WebSocket
-#         if not await processor.connect_ws():
-#             logger.error("Failed to connect to WebSocket server")
-#             return
-
-#         # Start packet capture
-#         await processor.start_capture("Wi-Fi")
-        
-#     except KeyboardInterrupt:
-#         logger.info("Received keyboard interrupt")
-#     except Exception as e:
-#         logger.error(f"Unexpected error: {e}")
-#     finally:
-#         await processor.shutdown()
-
 
 if __name__ == "__main__":
-    logger.info("Packet sensor started")
+    logger.info("SecureFlow packet sensor v2.0 (dual-capture) starting …")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Packet sensor stopped by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
+    except Exception as exc:
+        logger.error("Fatal error: %s", exc)

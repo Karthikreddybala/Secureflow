@@ -6,7 +6,7 @@ const initialState = {
   alertCount: 0,
   alertFilter: 'all', // 'all', 'high', 'medium', 'low', 'normal'
   alertSort: 'newest', // 'newest', 'oldest', 'severity', 'score'
-  alertLimit: 100
+  alertLimit: 500  // display limit — all alerts are kept in memory
 }
 
 export const alertsSlice = createSlice({
@@ -20,11 +20,7 @@ export const alertsSlice = createSlice({
         id: Date.now() + Math.random(), // Unique ID for React keys
         timestamp: action.payload.timestamp || Date.now()
       })
-      
-      if (state.alerts.length > 1000) {
-        state.alerts = state.alerts.slice(0, 1000)
-      }
-      
+      // No hard cap — all live alerts are kept; display is paged via alertLimit
       state.lastAlertTime = Date.now()
       state.alertCount += 1
     },

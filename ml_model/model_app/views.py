@@ -217,14 +217,224 @@ def _decay_scores():
 
 threading.Thread(target=_decay_scores, daemon=True).start()
 
+
+# ── SMTP / Email Configuration ─────────────────────────────────────────────────
+import smtplib
+import os as _os
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+_SMTP_HOST = _os.getenv('SMTP_HOST', 'smtp.gmail.com')
+_SMTP_PORT = int(_os.getenv('SMTP_PORT', 587))
+_SMTP_USER = _os.getenv('SMTP_USER', '')
+_SMTP_PASS = _os.getenv('SMTP_PASSWORD', '')
+_SMTP_FROM = _os.getenv('SMTP_FROM', _os.getenv('SMTP_USER', ''))
+
+# Per-device email cooldown: (device_ip, email) → last_sent_timestamp
+_dev_email_cooldown: dict[tuple, float] = {}
+_DEV_EMAIL_COOLDOWN_SECS = 300   # max 1 email per device+recipient per 5 min
+_dev_email_lock = threading.Lock()
+
+_SEV_ORDER = {'Low': 0, 'Medium': 1, 'High': 2}
+
+
+def _send_device_alert_email(device_ip: str, device_mac: str, alert: dict):
+    """Send email to all DeviceAlertEmail rules matching this device IP/MAC.
+    Runs lookups in a background thread — never blocks the hot path.
+    """
+    if not _SMTP_USER or not _SMTP_PASS:
+        return
+    severity = alert.get('final', {}).get('severity', 'Low')
+
+    def _worker():
+        try:
+            from model_app.models import DeviceAlertEmail
+            import django.db
+            from django.db import models as _dj_models
+            rules = DeviceAlertEmail.objects.filter(enabled=True).filter(
+                _dj_models.Q(ip=device_ip) | _dj_models.Q(mac__iexact=device_mac)
+            )
+            now = time.time()
+            for rule in rules:
+                if _SEV_ORDER.get(severity, 0) < _SEV_ORDER.get(rule.min_severity, 1):
+                    continue
+                key = (device_ip, rule.email)
+                with _dev_email_lock:
+                    if now - _dev_email_cooldown.get(key, 0) < _DEV_EMAIL_COOLDOWN_SECS:
+                        continue
+                    _dev_email_cooldown[key] = now
+                _do_send_email(rule.email, device_ip, rule.label or device_ip, alert)
+        except Exception as _e:
+            logger.warning('Device email worker error: %s', _e)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _do_send_email(to: str, device_ip: str, device_label: str, alert: dict):
+    """Blocking SMTP send — always called from a daemon thread."""
+    try:
+        f = alert.get('final', {})
+        m = alert.get('mitre', {})
+        attack   = f.get('attack_type', 'Unknown')
+        sev      = f.get('severity', 'Unknown')
+        score    = f.get('final_score', 0)
+        src_ip   = alert.get('src_ip', '—')
+        dst_ip   = alert.get('dst_ip', '—')
+        sport    = alert.get('sport', '?')
+        dport    = alert.get('dport', '?')
+        protocol = alert.get('protocol', '—')
+        mitre_id = m.get('id', '—')
+        mitre_nm = m.get('name', '—')
+        tactic   = m.get('tactic', '—')
+        ts       = time.strftime('%Y-%m-%d %H:%M:%S',
+                                 time.localtime(alert.get('timestamp', time.time())))
+        sev_color = {'High': '#f85149', 'Medium': '#d29922'}.get(sev, '#3fb950')
+        shap_rows = ''.join(
+            f'<tr><td style="padding:6px 8px;color:#8b949e;">{s["feature"]}</td>'
+            f'<td style="padding:6px 8px;color:{"#f85149" if s["impact"]>0 else "#58a6ff"};'
+            f'font-family:monospace;">{("+" if s["impact"]>0 else "")}{s["impact"]}</td></tr>'
+            for s in alert.get('shap', [])
+        )
+
+        subject = f'[SecureFlow] {sev} Alert \u2014 {attack} | Device {device_label}'
+        html = f"""
+<html><body style="margin:0;padding:0;background:#0d1117;font-family:Arial,sans-serif;">
+<div style="max-width:620px;margin:24px auto;background:#161b22;border-radius:14px;
+            padding:28px;border:1px solid #30363d;">
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
+    <div style="width:42px;height:42px;background:{sev_color}22;border-radius:10px;
+                display:flex;align-items:center;justify-content:center;
+                font-size:20px;">\U0001f6a8</div>
+    <div>
+      <div style="font-size:18px;font-weight:700;color:#e6edf3;">SecureFlow IDS Alert</div>
+      <div style="font-size:12px;color:#8b949e;">{ts}</div>
+    </div>
+  </div>
+
+  <div style="background:{sev_color}18;border:1px solid {sev_color}44;
+              border-radius:8px;padding:14px 16px;margin-bottom:18px;">
+    <div style="font-size:20px;font-weight:800;color:{sev_color};">{attack}</div>
+    <div style="font-size:13px;color:{sev_color}cc;margin-top:2px;">
+      Severity: <strong>{sev}</strong> &nbsp;|&nbsp; Score: {score:.1f}/100
+    </div>
+  </div>
+
+  <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+    <tr style="background:#0d111788;">
+      <td style="padding:8px 10px;color:#8b949e;font-size:13px;width:38%;">Device</td>
+      <td style="padding:8px 10px;color:#e6edf3;font-size:13px;">{device_label}</td>
+    </tr>
+    <tr>
+      <td style="padding:8px 10px;color:#8b949e;font-size:13px;">Device IP</td>
+      <td style="padding:8px 10px;font-family:monospace;color:#58a6ff;font-size:13px;">{device_ip}</td>
+    </tr>
+    <tr style="background:#0d111788;">
+      <td style="padding:8px 10px;color:#8b949e;font-size:13px;">Flow</td>
+      <td style="padding:8px 10px;font-family:monospace;color:#e6edf3;font-size:12px;">{protocol} {src_ip}:{sport} \u2192 {dst_ip}:{dport}</td>
+    </tr>
+    <tr>
+      <td style="padding:8px 10px;color:#8b949e;font-size:13px;">MITRE ATT&amp;CK</td>
+      <td style="padding:8px 10px;color:#e6edf3;font-size:13px;">{mitre_id} \u2014 {mitre_nm}</td>
+    </tr>
+    <tr style="background:#0d111788;">
+      <td style="padding:8px 10px;color:#8b949e;font-size:13px;">Tactic</td>
+      <td style="padding:8px 10px;color:#e6edf3;font-size:13px;">{tactic}</td>
+    </tr>
+  </table>
+
+  {(f'<div style="margin-bottom:16px;"><div style="font-size:12px;color:#8b949e;margin-bottom:6px;">SHAP Feature Drivers</div><table style="width:100%;border-collapse:collapse;font-size:12px;">{shap_rows}</table></div>') if shap_rows else ''}
+
+  <div style="border-top:1px solid #30363d;padding-top:14px;font-size:11px;color:#484f58;">Sent by SecureFlow IDS Gateway &nbsp;|&nbsp; Do not reply</div>
+</div></body></html>"""
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From']    = _SMTP_FROM
+        msg['To']      = to
+        msg.attach(MIMEText(html, 'html'))
+
+        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=12) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(_SMTP_USER, _SMTP_PASS)
+            s.sendmail(_SMTP_FROM, [to], msg.as_string())
+        logger.info('\U0001f4e7 Device alert email sent \u2192 %s  device=%s', to, device_ip)
+    except Exception as exc:
+        logger.warning('\u2717 Email to %s failed: %s', to, exc)
+
+
+# ── VAPID Web Push ─────────────────────────────────────────────────────────────
+_VAPID_PRIVATE_KEY = _os.getenv('VAPID_PRIVATE_KEY', '')
+_VAPID_PUBLIC_KEY  = _os.getenv('VAPID_PUBLIC_KEY', '')
+_VAPID_CLAIMS      = {'sub': f'mailto:{_os.getenv("SMTP_USER", "secureflow@localhost")}'}
+
+
+def _send_push_notifications(alert: dict):
+    """Send Web Push to all registered browser subscriptions."""
+    if not _VAPID_PRIVATE_KEY or not _VAPID_PUBLIC_KEY:
+        return
+
+    def _worker():
+        try:
+            from pywebpush import webpush, WebPushException
+            from model_app.models import PushSubscription
+            import json as _json
+
+            f     = alert.get('final', {})
+            attack = f.get('attack_type', 'Unknown')
+            sev    = f.get('severity', 'Low')
+            src    = alert.get('src_ip', '?')
+            subs   = list(PushSubscription.objects.all())
+
+            payload = _json.dumps({
+                'title': f'\U0001f6a8 SecureFlow — {sev} Alert',
+                'body':  f'{attack} detected from {src}',
+                'icon':  '/vite.svg',
+                'badge': '/vite.svg',
+                'data':  {'url': '/alerts', 'severity': sev},
+            })
+
+            dead_ids = []
+            for sub in subs:
+                try:
+                    webpush(
+                        subscription_info={
+                            'endpoint': sub.endpoint,
+                            'keys': {'p256dh': sub.p256dh, 'auth': sub.auth},
+                        },
+                        data=payload,
+                        vapid_private_key=_VAPID_PRIVATE_KEY,
+                        vapid_claims=_VAPID_CLAIMS,
+                    )
+                    PushSubscription.objects.filter(pk=sub.pk).update(last_used_at=time.time())
+                except WebPushException as e:
+                    if e.response and e.response.status_code in (404, 410):
+                        dead_ids.append(sub.pk)  # subscription expired
+                    else:
+                        logger.debug('Push to %s failed: %s', sub.endpoint[:40], e)
+                except Exception as e:
+                    logger.debug('Push error: %s', e)
+
+            if dead_ids:
+                PushSubscription.objects.filter(pk__in=dead_ids).delete()
+                logger.info('Pruned %d expired push subscriptions', len(dead_ids))
+        except ImportError:
+            logger.debug('pywebpush not installed — skipping push notification')
+        except Exception as exc:
+            logger.warning('Push notification worker error: %s', exc)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
 # ── IP Blocking ────────────────────────────────────────────────────────────────
 _blocked_ips: set[str] = set()
 _block_lock  = threading.Lock()
 
-def _block_ip_system(ip: str):
-    """Add a Windows Firewall inbound block rule for the given IP."""
-    if ip in ('unknown', '') or ip.startswith(('127.', '192.168.', '10.')):
-        return  # never block private/loopback
+def _block_ip_system(ip: str, force: bool = False):
+    """Add a Windows Firewall inbound block rule for the given IP.
+    force=True bypasses the private-IP guard (used for hotspot client blocks).
+    """
+    if not force and (ip in ('unknown', '') or ip.startswith(('127.', '10.'))):
+        return  # never block loopback
     with _block_lock:
         if ip in _blocked_ips:
             return
@@ -235,10 +445,516 @@ def _block_ip_system(ip: str):
                  f'name={rule}', 'dir=in', 'action=block', f'remoteip={ip}'],
                 capture_output=True, timeout=5
             )
+            subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                 f'name={rule}_out', 'dir=out', 'action=block', f'remoteip={ip}'],
+                capture_output=True, timeout=5
+            )
             _blocked_ips.add(ip)
             logger.info('Blocked IP via firewall: %s', ip)
         except Exception as exc:
             logger.warning('Firewall block failed for %s: %s', ip, exc)
+
+
+def _unblock_ip_system(ip: str):
+    """Remove Windows Firewall block rules for an IP."""
+    rule = f'SecureFlow_Block_{ip}'
+    try:
+        subprocess.run(['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={rule}'],
+                       capture_output=True, timeout=5)
+        subprocess.run(['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={rule}_out'],
+                       capture_output=True, timeout=5)
+        with _block_lock:
+            _blocked_ips.discard(ip)
+        logger.info('Unblocked IP via firewall: %s', ip)
+    except Exception as exc:
+        logger.warning('Firewall unblock failed for %s: %s', ip, exc)
+
+
+# ── Hotspot Device Tracker ──────────────────────────────────────────────────────
+import ipaddress
+import socket
+import collections
+
+_HOTSPOT_SUBNET = ipaddress.ip_network('192.168.137.0/24')
+_BANDWIDTH_HISTORY_SECS = 60   # keep 60 one-second buckets per device
+
+# ── MAC OUI → Vendor lookup ────────────────────────────────────────────────────
+# First 3 bytes (6 hex chars, no separators, upper-cased) → brand name
+_OUI_TABLE: dict[str, str] = {
+    # Apple
+    '000A27': 'Apple', '000D93': 'Apple', '0017F2': 'Apple', '001CB3': 'Apple',
+    '002312': 'Apple', '0026BB': 'Apple', '40A6D9': 'Apple', '44D884': 'Apple',
+    '3C0754': 'Apple', '8C8590': 'Apple', 'A4B197': 'Apple', 'D83062': 'Apple',
+    'F0DBF8': 'Apple', '60F81D': 'Apple', 'BC9FEF': 'Apple', '90B21F': 'Apple',
+    # Samsung
+    '002339': 'Samsung', '002566': 'Samsung', '0026E8': 'Samsung', '18AF61': 'Samsung',
+    '2C4401': 'Samsung', '3C8BFE': 'Samsung', '40B395': 'Samsung', '5495D2': 'Samsung',
+    '6C2F2C': 'Samsung', '8C77122': 'Samsung', 'A82174': 'Samsung', 'B4EF39': 'Samsung',
+    'CC07AB': 'Samsung', 'E4928D': 'Samsung', 'F025B7': 'Samsung', '02CF24': 'Samsung',
+    # Google / Android
+    'DA5F47': 'Google', 'F4F5E8': 'Google', '3C5AB4': 'Google', '40E230': 'Google',
+    # OnePlus
+    '946EE0': 'OnePlus', 'AC37A0': 'OnePlus', 'C8F230': 'OnePlus',
+    # Xiaomi
+    '0C1DAF': 'Xiaomi', '284FDB': 'Xiaomi', '34CE009': 'Xiaomi', '64B473': 'Xiaomi',
+    '8CBEBE': 'Xiaomi', 'AC2B6E': 'Xiaomi', 'F048EF': 'Xiaomi',
+    # Huawei
+    '001E10': 'Huawei', '009ACD': 'Huawei', '18CFCE': 'Huawei', '286ED4': 'Huawei',
+    '4CA8D9': 'Huawei', '68A0F6': 'Huawei', 'B48430': 'Huawei', 'E89C25': 'Huawei',
+    # Realme / OPPO
+    '00BBF8': 'OPPO', 'A45E60': 'OPPO', '2C4D54': 'Realme',
+    # Motorola
+    '000A28': 'Motorola', '001B98': 'Motorola', '5C51EC': 'Motorola', 'AC37A0': 'Motorola',
+    # Sony
+    '001EE1': 'Sony', '0013A9': 'Sony', '7C1E52': 'Sony', 'F07D68': 'Sony',
+    # LG
+    '001C62': 'LG', '58A2B5': 'LG', 'A88388': 'LG', 'C4346B': 'LG',
+    # Nokia / HMD
+    '18E2C2': 'Nokia', 'A0C9A0': 'Nokia', 'BC8508': 'Nokia',
+    # Dell
+    '001560': 'Dell', '14FEB5': 'Dell', '18A99B': 'Dell', 'B8AC6F': 'Dell',
+    # HP
+    '001083': 'HP', '3C4A92': 'HP', '6C3BE5': 'HP', 'F4CE46': 'HP',
+    # Lenovo
+    '0024E8': 'Lenovo', '4CF95D': 'Lenovo', '70728D': 'Lenovo', 'E86F38': 'Lenovo',
+    # Asus
+    '000D18': 'Asus', '1C872C': 'Asus', '2C4D54': 'Asus', '60A44C': 'Asus',
+    # Raspberry Pi
+    'B827EB': 'RaspberryPi', 'DC:A6:32': 'RaspberryPi', 'E4:5F:01': 'RaspberryPi',
+    # Amazon (Kindle/Echo)
+    '0C4785': 'Amazon', '44650D': 'Amazon', '74C246': 'Amazon', 'A002DC': 'Amazon',
+    # Intel (laptop Wi-Fi chips)
+    '001BEB': 'Intel', '001DEA': 'Intel', '086D41': 'Intel', '4C8093': 'Intel',
+    # Qualcomm
+    '00A0C6': 'Qualcomm',
+}
+
+
+def _oui_vendor(mac: str) -> str:
+    """Return the vendor name for a MAC address, or '' if unknown.
+    Accepts dashes or colons as separators (Windows or Linux format).
+    """
+    if not mac or mac in ('-', '---'):
+        return ''
+    # Normalise to 6 uppercase hex chars with no separator
+    clean = mac.upper().replace('-', '').replace(':', '')
+    if len(clean) < 6:
+        return ''
+    prefix = clean[:6]
+    return _OUI_TABLE.get(prefix, '')
+
+
+def _infer_device_type(vendor: str, hostname: str) -> str:
+    """Guess device category from vendor name and hostname."""
+    v = (vendor or '').lower()
+    h = (hostname or '').lower()
+    phones  = ('samsung', 'apple', 'iphone', 'xiaomi', 'huawei', 'oppo',
+               'realme', 'oneplus', 'nokia', 'motorola', 'sony', 'lg',
+               'google', 'pixel', 'android')
+    laptops = ('dell', 'hp', 'lenovo', 'asus', 'intel', 'macbook', 'thinkpad',
+               'laptop', 'notebook')
+    iot     = ('raspberry', 'amazon', 'echo', 'kindle', 'esp', 'arduino')
+    if any(p in v or p in h for p in phones):
+        return 'phone'
+    if any(p in v or p in h for p in laptops):
+        return 'laptop'
+    if any(p in v or p in h for p in iot):
+        return 'iot'
+    return 'unknown'
+
+
+def _is_hotspot_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip) in _HOTSPOT_SUBNET
+    except ValueError:
+        return False
+
+
+class _DeviceRecord:
+    """Per-device state tracked in memory."""
+    __slots__ = (
+        'ip', 'mac', 'hostname', 'first_seen', 'last_seen',
+        'bytes_up', 'bytes_down', 'packets_up', 'packets_down',
+        'status', 'top_ports', '_bw_history', '_bw_bucket_ts', '_bw_bucket',
+        'vendor', 'device_type',
+    )
+
+    def __init__(self, ip: str):
+        self.ip           = ip
+        self.mac          = ''
+        self.hostname     = ip
+        self.first_seen   = time.time()
+        self.last_seen    = time.time()
+        self.bytes_up     = 0       # device → internet
+        self.bytes_down   = 0       # internet → device
+        self.packets_up   = 0
+        self.packets_down = 0
+        self.status       = 'online'
+        self.top_ports: dict[int, int] = {}  # port → packet count
+        self.vendor       = ''
+        self.device_type  = 'unknown'
+        # Bandwidth history: deque of (ts, bytes_up, bytes_down) per second
+        self._bw_history: collections.deque = collections.deque(
+            maxlen=_BANDWIDTH_HISTORY_SECS
+        )
+        self._bw_bucket_ts = int(time.time())
+        self._bw_bucket    = [0, 0]   # [up_bytes, down_bytes] for current second
+
+    def record_packet(self, pkt_size: int, is_upload: bool, dport: int):
+        self.last_seen = time.time()
+        self.status    = 'online'
+        if is_upload:
+            self.bytes_up   += pkt_size
+            self.packets_up += 1
+        else:
+            self.bytes_down   += pkt_size
+            self.packets_down += 1
+
+        # Bandwidth bucket
+        now_bucket = int(time.time())
+        if now_bucket != self._bw_bucket_ts:
+            self._bw_history.append((self._bw_bucket_ts, self._bw_bucket[0], self._bw_bucket[1]))
+            self._bw_bucket    = [0, 0]
+            self._bw_bucket_ts = now_bucket
+        if is_upload:
+            self._bw_bucket[0] += pkt_size
+        else:
+            self._bw_bucket[1] += pkt_size
+
+        # Top-ports (cap at 20)
+        if dport and dport > 0:
+            self.top_ports[dport] = self.top_ports.get(dport, 0) + 1
+            if len(self.top_ports) > 20:
+                min_port = min(self.top_ports, key=self.top_ports.get)
+                del self.top_ports[min_port]
+
+    def to_dict(self) -> dict:
+        # _host_scores is defined in this same module — no import needed
+        threat = _host_scores.get(self.ip, {}).get('score', 0.0)
+        bw_hist = list(self._bw_history)
+        # Add current incomplete bucket
+        bw_hist.append((self._bw_bucket_ts, self._bw_bucket[0], self._bw_bucket[1]))
+        top3 = sorted(self.top_ports.items(), key=lambda x: x[1], reverse=True)[:5]
+        return {
+            'ip':          self.ip,
+            'mac':         self.mac,
+            'hostname':    self.hostname,
+            'vendor':      self.vendor,
+            'device_type': self.device_type,
+            'first_seen':  self.first_seen,
+            'last_seen':   self.last_seen,
+            'bytes_up':    self.bytes_up,
+            'bytes_down':  self.bytes_down,
+            'packets_up':  self.packets_up,
+            'packets_down':self.packets_down,
+            'status':      self.status if self.ip not in _blocked_ips else 'blocked',
+            'threat_score':round(threat, 1),
+            'top_ports':   [{'port': p, 'count': c} for p, c in top3],
+            'bw_history':  [{'ts': ts, 'up': u, 'down': d} for ts, u, d in bw_hist[-60:]],
+        }
+
+
+class HotspotDeviceTracker:
+    """Thread-safe in-memory store of all hotspot-connected devices."""
+
+    def __init__(self):
+        self._devices: dict[str, _DeviceRecord] = {}
+        self._lock    = threading.Lock()
+        self._resolver_cache: dict[str, str] = {}
+        # Immediate: query the hotspot neighbor table right now
+        threading.Thread(target=self._query_hotspot_clients, daemon=True).start()
+        # Background: poll neighbor table every 8 s (router-style)
+        threading.Thread(target=self._neighbor_poller, daemon=True).start()
+        # Background: mark devices offline when they leave the neighbor table
+        threading.Thread(target=self._staleness_checker, daemon=True).start()
+
+    def observe(self, src: str, dst: str, pkt_size: int, dport: int):
+        """Called for every packet from the hotspot adapter.
+        Gateway IP (192.168.137.1) is the laptop acting as router — it is
+        NEVER treated as a client device, even though it's in the subnet.
+        """
+        _GATEWAY = '192.168.137.1'
+        # A 'client' is a hotspot IP that is NOT the gateway itself
+        src_is_client = _is_hotspot_ip(src) and src != _GATEWAY
+        dst_is_client = _is_hotspot_ip(dst) and dst != _GATEWAY
+
+        with self._lock:
+            if src_is_client:
+                # src is a hotspot client sending data (upload)
+                rec = self._devices.setdefault(src, _DeviceRecord(src))
+                rec.record_packet(pkt_size, is_upload=True, dport=dport)
+            if dst_is_client and not src_is_client:
+                # dst is a hotspot client receiving data (download)
+                # src could be the gateway (NAT) or the internet — doesn't matter
+                rec = self._devices.setdefault(dst, _DeviceRecord(dst))
+                rec.record_packet(pkt_size, is_upload=False, dport=dport)
+
+    def observe_wifi(self, src: str, dst: str, pkt_size: int, dport: int):
+        """Called for packets tagged 'wifi' (primary Wi-Fi NIC / gateway).
+        Only updates EXISTING hotspot client records — does NOT create new ones.
+        Captures NAT-reflected download traffic seen on the Wi-Fi card:
+          internet IP → 192.168.137.x  (before Windows NAT forwards it)
+        This completes the bandwidth picture for each connected device.
+        """
+        _GATEWAY = '192.168.137.1'
+        with self._lock:
+            if dst in self._devices and dst != _GATEWAY:
+                self._devices[dst].record_packet(pkt_size, is_upload=False, dport=dport)
+            elif src in self._devices and src != _GATEWAY:
+                self._devices[src].record_packet(pkt_size, is_upload=True, dport=dport)
+
+    def get_all(self) -> list[dict]:
+        with self._lock:
+            return [d.to_dict() for d in self._devices.values()]
+
+    def get_stats(self) -> dict:
+        with self._lock:
+            devices  = list(self._devices.values())
+            total    = len(devices)
+            online   = sum(1 for d in devices if d.status == 'online')
+            blocked  = sum(1 for d in devices if d.ip in _blocked_ips)
+            bw_up    = sum(d.bytes_up   for d in devices)
+            bw_down  = sum(d.bytes_down for d in devices)
+        return {
+            'total_devices':   total,
+            'online_devices':  online,
+            'blocked_devices': blocked,
+            'total_bytes_up':  bw_up,
+            'total_bytes_down':bw_down,
+            'gateway_ip':      '192.168.137.1',
+            'subnet':          '192.168.137.0/24',
+        }
+
+    def _staleness_checker(self):
+        """Every 20 s: re-query neighbor table and mark devices online/offline
+        based on whether they still appear with a valid MAC — not on packet flow.
+        """
+        while True:
+            time.sleep(20)
+            live = self._get_neighbor_ips()   # set of IPs currently in neighbor table
+            with self._lock:
+                for ip, d in self._devices.items():
+                    if ip in _blocked_ips:
+                        continue
+                    if ip in live:
+                        d.status   = 'online'
+                        d.last_seen = time.time()
+                    else:
+                        d.status = 'offline'
+
+    # ── Public: force immediate discovery (router-style) ─────────────────────
+    def scan_now(self) -> list[dict]:
+        """Query the neighbor table immediately and return current device list.
+        Also runs a background ping-sweep so new devices populate the table fast.
+        """
+        # Non-blocking ping sweep in background to force ARP resolution
+        threading.Thread(target=self._ping_sweep, daemon=True).start()
+        # Then query the neighbor table (blocks ~1 s)
+        self._query_hotspot_clients()
+        self._resolve_hostnames()
+        with self._lock:
+            return [d.to_dict() for d in self._devices.values()]
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    # States from Get-NetNeighbor that mean the device is connected/reachable.
+    # Delay  = ARP reply received, verifying (brief transient before Reachable)
+    # Stale  = cache entry aging but device may still be connected
+    # Permanent = hotspot assigns this to connected Wi-Fi clients
+    _LIVE_STATES = {'Reachable', 'Permanent', 'Stale', 'Delay'}
+    # MACs to always ignore (null / broadcast)
+    _SKIP_MACS   = {'00-00-00-00-00-00', 'ff-ff-ff-ff-ff-ff',
+                    'FF-FF-FF-FF-FF-FF', '00:00:00:00:00:00', ''}
+
+    def _get_neighbor_ips(self) -> set:
+        """Return set of IPs currently in the hotspot subnet ARP cache.
+        Uses 'arp -a' (~20 ms) — only entries with a resolved MAC appear,
+        so presence = connected, absence = disconnected/unreachable.
+        """
+        live = set()
+        try:
+            result = subprocess.run(
+                ['arp', '-a'], capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                ip  = parts[0].strip()
+                mac = parts[1].strip().upper()
+                if not _is_hotspot_ip(ip):
+                    continue
+                if ip in ('192.168.137.1', '192.168.137.255'):
+                    continue
+                if mac in self._SKIP_MACS:
+                    continue
+                live.add(ip)
+        except Exception as exc:
+            logger.debug('_get_neighbor_ips error: %s', exc)
+        return live
+
+    def _query_hotspot_clients(self):
+        """Router-style discovery using 'arp -a' (~20 ms).
+        Windows only prints ARP entries that have been successfully resolved —
+        so every entry here represents a device that IS currently connected.
+        Completely independent of Npcap / packet flow.
+        """
+        try:
+            result = subprocess.run(
+                ['arp', '-a'], capture_output=True, text=True, timeout=5
+            )
+            seen_ips = set()
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                ip  = parts[0].strip()
+                mac = parts[1].strip().upper().replace(':', '-')
+
+                # Subnet + skip gateway/broadcast
+                if not _is_hotspot_ip(ip):
+                    continue
+                if ip in ('192.168.137.1', '192.168.137.255'):
+                    continue
+                # Skip null / broadcast MACs
+                if mac in self._SKIP_MACS:
+                    continue
+
+                seen_ips.add(ip)
+                vendor = _oui_vendor(mac)
+
+                with self._lock:
+                    if ip not in self._devices:
+                        rec             = _DeviceRecord(ip)
+                        rec.mac         = mac
+                        rec.vendor      = vendor
+                        rec.device_type = _infer_device_type(vendor, '')
+                        rec.status      = 'online'
+                        self._devices[ip] = rec
+                        logger.info(
+                            'Hotspot client connected: %s  MAC=%s  vendor=%s',
+                            ip, mac, vendor
+                        )
+                    else:
+                        d = self._devices[ip]
+                        if not d.mac:
+                            d.mac = mac
+                        if not d.vendor:
+                            d.vendor = vendor
+                        if d.status != 'blocked':
+                            d.status    = 'online'
+                            d.last_seen = time.time()
+
+            # Mark devices no longer in ARP table as offline
+            with self._lock:
+                for ip, d in self._devices.items():
+                    if ip not in seen_ips and ip not in _blocked_ips:
+                        if d.status == 'online':
+                            d.status = 'offline'
+                            logger.info('Hotspot client disconnected: %s', ip)
+
+        except Exception as exc:
+            logger.warning('_query_hotspot_clients error: %s', exc, exc_info=True)
+
+    def _ping_sweep(self):
+        """Send a fast ping to 192.168.137.1-254 to force neighbour-table entries.
+        Runs all pings concurrently; finishes in ~2 s.
+        """
+        import concurrent.futures
+        hosts = [f'192.168.137.{i}' for i in range(2, 255)]
+
+        def _ping(ip):
+            try:
+                subprocess.run(
+                    ['ping', '-n', '1', '-w', '400', ip],
+                    capture_output=True, timeout=2
+                )
+            except Exception:
+                pass
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=50) as pool:
+                pool.map(_ping, hosts, timeout=10)
+        except Exception as exc:
+            logger.debug('Ping sweep error: %s', exc)
+
+    def _resolve_hostnames(self):
+        """Multi-strategy device name resolver:
+        1. DNS reverse lookup (gethostbyaddr)
+        2. NetBIOS name via nbtstat -A (Windows)
+        3. OUI vendor prefix from MAC
+        4. Friendly label fallback: 'Device-<last 4 of IP>'
+        """
+        with self._lock:
+            to_resolve = [
+                (ip, d.mac) for ip, d in self._devices.items()
+                if d.hostname == ip  # still unresolved
+            ]
+        for ip, mac in to_resolve:
+            if ip in self._resolver_cache:
+                host, vendor = self._resolver_cache[ip]
+            else:
+                host   = None
+                vendor = _oui_vendor(mac)
+
+                # ── Strategy 1: DNS reverse lookup ───────────────────────
+                try:
+                    dns_name = socket.gethostbyaddr(ip)[0]
+                    if dns_name and dns_name != ip:
+                        host = dns_name
+                except Exception:
+                    pass
+
+                # ── Strategy 2: NetBIOS (nbtstat -A <ip>) ────────────────
+                if not host:
+                    try:
+                        nb = subprocess.run(
+                            ['nbtstat', '-A', ip],
+                            capture_output=True, text=True, timeout=4
+                        )
+                        for nline in nb.stdout.splitlines():
+                            # Line format:  NAME        <00>  UNIQUE  Registered
+                            parts = nline.split()
+                            if len(parts) >= 3 and '<00>' in nline and 'UNIQUE' in nline:
+                                candidate = parts[0].strip()
+                                if candidate and candidate.upper() not in ('NAME', 'NODE'):
+                                    host = candidate
+                                    break
+                    except Exception:
+                        pass
+
+                # ── Strategy 3: Friendly label from vendor + IP tail ─────
+                if not host:
+                    tail = ip.split('.')[-1]
+                    if vendor:
+                        host = f'{vendor}-{tail}'
+                    else:
+                        host = f'Device-{tail}'
+
+                self._resolver_cache[ip] = (host, vendor)
+
+            with self._lock:
+                if ip in self._devices:
+                    self._devices[ip].hostname = host
+                    if vendor and not self._devices[ip].vendor:
+                        self._devices[ip].vendor = vendor
+                    # Infer device_type from vendor name
+                    self._devices[ip].device_type = _infer_device_type(vendor, host)
+
+    def _neighbor_poller(self):
+        """Background loop: poll Windows neighbor table every 8 s.
+        This is the primary device discovery mechanism — like a router's
+        connected-clients table. No packet capture required.
+        """
+        while True:
+            time.sleep(8)
+            self._query_hotspot_clients()
+            self._resolve_hostnames()
+
+
+# Global tracker instance
+_hotspot_tracker = HotspotDeviceTracker()
 
 # ── In-memory flow table ───────────────────────────────────────────────────────
 flows      = {}
@@ -394,7 +1110,28 @@ def _ingest_packet_locked(packet):
         if flags & _URG: flow['bwd_urg'] += 1
 
     flow['last'] = now
+
+    # ── Hotspot device bandwidth tracking ─────────────────────────────────────
+    # Dual-path tracking:
+    #   'hotspot' tag  → full bidirectional accounting (client-side)
+    #   'wifi' tag     → update EXISTING clients' download counters (NAT reflection)
+    #   '' / 'pcap'   → treated same as hotspot (PCAP replay compatibility)
+    source_iface = packet.get('source_iface', '')
+    src   = str(packet.get('src', ''))
+    dst   = str(packet.get('dst', ''))
+    dport = int(packet.get('dport', 0))
+
+    if source_iface == 'wifi':
+        # Wi-Fi NIC sees internet↔client traffic through NAT.
+        # Only update known device records — discovery is ARP-based, not flow-based.
+        _hotspot_tracker.observe_wifi(src, dst, packet_size, dport)
+    else:
+        # Hotspot adapter or PCAP: full bidirectional bandwidth accounting.
+        if _is_hotspot_ip(src) or _is_hotspot_ip(dst):
+            _hotspot_tracker.observe(src, dst, packet_size, dport)
+
     return True
+
 
 
 # ── Active / Idle helper (CICFlowMeter definition) ────────────────────────────
@@ -634,41 +1371,58 @@ def _predict_alerts(flow_items):
 
         alerts.append(alert)
 
+        # ── Per-device email + browser push for Medium/High hotspot alerts ─────
+        _alert_sev = fused.get('severity', 'Low')
+        if _alert_sev in ('Medium', 'High') and attack_type.lower() != 'normal':
+            if _is_hotspot_ip(src_ip):
+                # Get MAC from tracker for richer email matching
+                _dev_mac = ''
+                try:
+                    with _hotspot_tracker._lock:
+                        _dev_rec = _hotspot_tracker._devices.get(src_ip)
+                        if _dev_rec:
+                            _dev_mac = _dev_rec.mac
+                except Exception:
+                    pass
+                _send_device_alert_email(src_ip, _dev_mac, alert)
+            # Push notification to all registered browser subscribers
+            _send_push_notifications(alert)
+
         # ── Persist classified flow to NetworkFlow table ──────────────────────
         try:
             _persist_flow(fid, flow_items[idx][1], alert)
         except Exception as _pf_err:
             logger.debug('_persist_flow skipped: %s', _pf_err)
 
+    # ── After loop: update in-memory store + bulk DB write ────────────────────
+    global _recent_alerts
+    _recent_alerts = (_recent_alerts + alerts)[-_MAX_RECENT:]
 
-        global _recent_alerts
-        _recent_alerts = (_recent_alerts + alerts)[-_MAX_RECENT:]
-
-        # ── Persist to database ───────────────────────────────────────────────
-        db_records = []
-        for a in alerts:
-            f = a.get('final', {})
-            m = a.get('mitre', {})
-            db_records.append(AlertRecord(
-                timestamp    = a.get('timestamp', time.time()),
-                src_ip       = (a.get('src_ip') or None),
-                dst_ip       = (a.get('dst_ip') or None),
-                sport        = (a.get('sport') or None),
-                dport        = (a.get('dport') or None),
-                protocol     = a.get('protocol', ''),
-                attack_type  = f.get('attack_type', ''),
-                severity     = f.get('severity', ''),
-                confidence   = float(f.get('final_score', 0.0)),
-                mitre_id     = m.get('id', ''),
-                mitre_tactic = m.get('tactic', ''),
-                abuse_score  = int(a.get('abuse_score', 0)),
-                incident_id  = str(a.get('incident_id', '')),
-                is_simulated = a.get('is_simulated', False),
-            ))
-        try:
-            AlertRecord.objects.bulk_create(db_records, ignore_conflicts=True)
-        except Exception as db_err:
-            logger.warning('DB write failed: %s', db_err)
+    # ── Persist batch to database (one write for the whole batch) ─────────────
+    db_records = []
+    for a in alerts:
+        f = a.get('final', {})
+        m = a.get('mitre', {})
+        db_records.append(AlertRecord(
+            timestamp    = a.get('timestamp', time.time()),
+            src_ip       = (a.get('src_ip') or None),
+            dst_ip       = (a.get('dst_ip') or None),
+            sport        = (a.get('sport') or None),
+            dport        = (a.get('dport') or None),
+            protocol     = a.get('protocol', ''),
+            attack_type  = f.get('attack_type', ''),
+            severity     = f.get('severity', ''),
+            confidence   = float(f.get('final_score', 0.0)),
+            mitre_id     = m.get('id', ''),
+            mitre_tactic = m.get('tactic', ''),
+            abuse_score  = int(a.get('abuse_score', 0)),
+            incident_id  = str(a.get('incident_id', '')),
+            is_simulated = a.get('is_simulated', False),
+        ))
+    try:
+        AlertRecord.objects.bulk_create(db_records, ignore_conflicts=True)
+    except Exception as db_err:
+        logger.warning('DB write failed: %s', db_err)
 
 
     elapsed_ms = (time.time() - start) * 1000.0
@@ -1418,3 +2172,441 @@ def manage_blocked_ips_db(request):
 
     return _cors(JsonResponse({'error': 'Method not allowed'}, status=405))
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── HOTSPOT DEVICE MANAGEMENT ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_hotspot_devices(request):
+    """
+    GET /model_app/hotspot/devices
+    Returns all seen hotspot devices with live stats.
+    """
+    devices = _hotspot_tracker.get_all()
+    # Sort: online first, then offline, blocked last
+    order = {'online': 0, 'offline': 1, 'blocked': 2}
+    devices.sort(key=lambda d: (order.get(d['status'], 9), -d['last_seen']))
+    return _cors(JsonResponse({'devices': devices, 'count': len(devices)}))
+
+
+def get_hotspot_stats(request):
+    """
+    GET /model_app/hotspot/stats
+    Returns gateway-level aggregated stats.
+    """
+    return _cors(JsonResponse(_hotspot_tracker.get_stats()))
+
+
+@csrf_exempt
+def manage_hotspot_device(request, device_ip):
+    """
+    POST /model_app/hotspot/devices/<ip>/action
+    Body: { "action": "block" | "unblock" | "refresh" }
+    """
+    if request.method == 'OPTIONS':
+        resp = JsonResponse({})
+        resp['Access-Control-Allow-Origin']  = '*'
+        resp['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        resp['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
+    if request.method != 'POST':
+        return _cors(JsonResponse({'error': 'POST only'}, status=405))
+
+    try:
+        body   = json.loads(request.body or '{}')
+        action = body.get('action', 'block')
+    except Exception:
+        return _cors(JsonResponse({'error': 'Invalid JSON'}, status=400))
+
+    if not _is_hotspot_ip(device_ip):
+        return _cors(JsonResponse({'error': 'Not a hotspot IP'}, status=400))
+
+    if action == 'block':
+        _block_ip_system(device_ip, force=True)
+        # Also persist to DB
+        try:
+            _block_ip_db(device_ip, reason='Hotspot client blocked via dashboard', blocked_by='dashboard')
+        except Exception:
+            pass
+        # Push update via WebSocket
+        _push_device_update()
+        return _cors(JsonResponse({'status': 'blocked', 'ip': device_ip}))
+
+    elif action == 'unblock':
+        _unblock_ip_system(device_ip)
+        try:
+            _unblock_ip_db(device_ip, unblocked_by='dashboard')
+        except Exception:
+            pass
+        _push_device_update()
+        return _cors(JsonResponse({'status': 'unblocked', 'ip': device_ip}))
+
+    return _cors(JsonResponse({'error': f'Unknown action: {action}'}, status=400))
+
+
+def _push_device_update():
+    """Push fresh device list to all WebSocket subscribers."""
+    try:
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+        layer   = get_channel_layer()
+        devices = _hotspot_tracker.get_all()
+        stats   = _hotspot_tracker.get_stats()
+        async_to_sync(layer.group_send)(
+            'hotspot_devices',
+            {'type': 'send_devices', 'data': {'devices': devices, 'stats': stats}}
+        )
+    except Exception as exc:
+        logger.debug('Device push error: %s', exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── HOTSPOT ACTIVE SCAN ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@csrf_exempt
+def scan_hotspot_now(request):
+    """
+    POST /model_app/hotspot/scan
+    Triggers a full ping sweep of the hotspot subnet (192.168.137.0/24),
+    reads ARP table, creates device records for any new clients, and
+    pushes the result to all WebSocket subscribers.
+
+    Returns the full device list immediately.
+    """
+    if request.method == 'OPTIONS':
+        resp = JsonResponse({})
+        resp['Access-Control-Allow-Origin']  = '*'
+        resp['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        resp['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
+    if request.method not in ('POST', 'GET'):
+        return _cors(JsonResponse({'error': 'GET or POST only'}, status=405))
+
+    try:
+        logger.info('Manual hotspot scan triggered via API')
+        devices = _hotspot_tracker.scan_now()
+        stats   = _hotspot_tracker.get_stats()
+        # Broadcast the fresh data to any open WebSocket clients
+        _push_device_update()
+        return _cors(JsonResponse({
+            'status':  'ok',
+            'scanned': True,
+            'devices': devices,
+            'stats':   stats,
+            'count':   len(devices),
+        }))
+    except Exception as exc:
+        logger.error('Hotspot scan error: %s', exc)
+        return _cors(JsonResponse({'error': str(exc)}, status=500))
+
+
+def hotspot_arp_check(request):
+    """
+    GET /model_app/hotspot/arp_check
+    Returns the Windows neighbor table filtered to the hotspot subnet.
+    Uses Get-NetNeighbor (same source as the tracker) so state is accurate.
+    """
+    try:
+        ps = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             'Get-NetNeighbor -AddressFamily IPv4 '
+             '| Select-Object -Property IPAddress,LinkLayerAddress,State,InterfaceAlias '
+             '| ConvertTo-Csv -NoTypeInformation'],
+            capture_output=True, text=True, timeout=10
+        )
+        rows = []
+        live_count = 0
+        _live = {'Reachable', 'Permanent', 'Stale'}
+        for line in ps.stdout.splitlines()[1:]:
+            parts = [p.strip('"') for p in line.split(',')]
+            if len(parts) < 4:
+                continue
+            ip, mac, state, iface = parts[0], parts[1], parts[2], parts[3]
+            if not _is_hotspot_ip(ip):
+                continue
+            is_live = (state in _live
+                       and mac not in ('00-00-00-00-00-00', 'FF-FF-FF-FF-FF-FF', '00:00:00:00:00:00'))
+            if is_live:
+                live_count += 1
+            rows.append({
+                'ip':     ip,
+                'mac':    mac,
+                'state':  state,
+                'iface':  iface,
+                'vendor': _oui_vendor(mac),
+                'live':   is_live,
+            })
+        # Sort: live first
+        rows.sort(key=lambda r: (0 if r['live'] else 1, r['ip']))
+        return _cors(JsonResponse({
+            'neighbor_entries': rows,
+            'total':      len(rows),
+            'live_count': live_count,
+            'note':       'live=true means device is connected (Reachable/Permanent/Stale state with valid MAC)',
+        }))
+    except Exception as exc:
+        return _cors(JsonResponse({'error': str(exc)}, status=500))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── DEVICE ALERT EMAIL RULES ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@csrf_exempt
+def manage_device_emails(request):
+    """
+    GET    /model_app/device_emails          → list all rules (+ connected hotspot devices)
+    POST   /model_app/device_emails          → create new rule
+    """
+    try:
+        from model_app.models import DeviceAlertEmail
+    except ImportError:
+        from .models import DeviceAlertEmail
+
+    if request.method == 'OPTIONS':
+        resp = JsonResponse({})
+        resp['Access-Control-Allow-Origin']  = '*'
+        resp['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        resp['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
+    if request.method == 'GET':
+        rules   = [r.to_dict() for r in DeviceAlertEmail.objects.all()]
+        devices = _hotspot_tracker.get_all()
+        return _cors(JsonResponse({'rules': rules, 'connected_devices': devices}))
+
+    if request.method == 'POST':
+        try:
+            body = json.loads(request.body or '{}')
+            ip           = body.get('ip', '').strip()
+            email        = body.get('email', '').strip()
+            label        = body.get('label', '').strip()
+            mac          = body.get('mac', '').strip()
+            min_severity = body.get('min_severity', 'Medium')
+            enabled      = body.get('enabled', True)
+            if not email:
+                return _cors(JsonResponse({'error': 'email required'}, status=400))
+            if min_severity not in ('Low', 'Medium', 'High'):
+                min_severity = 'Medium'
+            rule = DeviceAlertEmail.objects.create(
+                ip=ip, mac=mac, label=label or ip,
+                email=email, min_severity=min_severity, enabled=enabled,
+            )
+            return _cors(JsonResponse({'status': 'created', 'rule': rule.to_dict()}))
+        except Exception as exc:
+            return _cors(JsonResponse({'error': str(exc)}, status=400))
+
+    return _cors(JsonResponse({'error': 'Method not allowed'}, status=405))
+
+
+@csrf_exempt
+def manage_device_email_detail(request, rule_id):
+    """
+    PUT    /model_app/device_emails/<id>     → update rule
+    DELETE /model_app/device_emails/<id>     → delete rule
+    """
+    try:
+        from model_app.models import DeviceAlertEmail
+    except ImportError:
+        from .models import DeviceAlertEmail
+
+    if request.method == 'OPTIONS':
+        resp = JsonResponse({})
+        resp['Access-Control-Allow-Origin']  = '*'
+        resp['Access-Control-Allow-Methods'] = 'PUT, DELETE, OPTIONS'
+        resp['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
+    try:
+        rule = DeviceAlertEmail.objects.get(pk=rule_id)
+    except DeviceAlertEmail.DoesNotExist:
+        return _cors(JsonResponse({'error': 'Rule not found'}, status=404))
+
+    if request.method in ('PUT', 'POST'):
+        try:
+            body = json.loads(request.body or '{}')
+            if 'ip'           in body: rule.ip           = body['ip'].strip()
+            if 'mac'          in body: rule.mac          = body['mac'].strip()
+            if 'label'        in body: rule.label        = body['label'].strip()
+            if 'email'        in body: rule.email        = body['email'].strip()
+            if 'min_severity' in body:
+                ms = body['min_severity']
+                rule.min_severity = ms if ms in ('Low', 'Medium', 'High') else 'Medium'
+            if 'enabled' in body: rule.enabled = bool(body['enabled'])
+            rule.save()
+            return _cors(JsonResponse({'status': 'updated', 'rule': rule.to_dict()}))
+        except Exception as exc:
+            return _cors(JsonResponse({'error': str(exc)}, status=400))
+
+    if request.method == 'DELETE':
+        rule.delete()
+        return _cors(JsonResponse({'status': 'deleted', 'id': rule_id}))
+
+    return _cors(JsonResponse({'error': 'Method not allowed'}, status=405))
+
+
+@csrf_exempt
+def test_device_email(request):
+    """
+    POST /model_app/device_emails/test
+    Body: { "rule_id": <int> }  OR  { "email": "x@y.com", "ip": "192.168.137.x", "label": "..." }
+    Sends a synthetic test alert email so the user can verify SMTP settings.
+    """
+    if request.method == 'OPTIONS':
+        resp = JsonResponse({})
+        resp['Access-Control-Allow-Origin'] = '*'
+        resp['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        resp['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
+    if request.method != 'POST':
+        return _cors(JsonResponse({'error': 'POST only'}, status=405))
+
+    if not _SMTP_USER or not _SMTP_PASS:
+        return _cors(JsonResponse({
+            'error': 'SMTP not configured. Set SMTP_USER and SMTP_PASSWORD in .env',
+        }, status=400))
+
+    try:
+        body = json.loads(request.body or '{}')
+    except Exception:
+        return _cors(JsonResponse({'error': 'Invalid JSON'}, status=400))
+
+    try:
+        from model_app.models import DeviceAlertEmail
+    except ImportError:
+        from .models import DeviceAlertEmail
+
+    rule_id = body.get('rule_id')
+    if rule_id:
+        try:
+            rule  = DeviceAlertEmail.objects.get(pk=int(rule_id))
+            to    = rule.email
+            dev_ip    = rule.ip or '192.168.137.x'
+            dev_label = rule.label or dev_ip
+        except DeviceAlertEmail.DoesNotExist:
+            return _cors(JsonResponse({'error': 'Rule not found'}, status=404))
+    else:
+        to        = body.get('email', '').strip()
+        dev_ip    = body.get('ip',    '192.168.137.x').strip()
+        dev_label = body.get('label', dev_ip).strip()
+        if not to:
+            return _cors(JsonResponse({'error': 'email or rule_id required'}, status=400))
+
+    # Build a synthetic test alert
+    test_alert = {
+        'final': {
+            'attack_type': 'TEST Alert',
+            'severity':    'Medium',
+            'final_score': 75.0,
+        },
+        'protocol':    'TCP',
+        'src_ip':      dev_ip,
+        'dst_ip':      '8.8.8.8',
+        'sport':       '54321',
+        'dport':       '443',
+        'timestamp':   time.time(),
+        'mitre':       {'id': 'T0000', 'name': 'Test Technique', 'tactic': 'Test'},
+        'shap':        [{'feature': 'Flow Duration', 'impact': 0.42}],
+        'abuse_score': 0,
+    }
+    threading.Thread(
+        target=_do_send_email,
+        args=(to, dev_ip, dev_label, test_alert),
+        daemon=True,
+    ).start()
+    return _cors(JsonResponse({'status': 'queued', 'to': to, 'device': dev_label}))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── WEB PUSH SUBSCRIPTION ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_vapid_public_key(request):
+    """GET /model_app/push/vapid_key — returns VAPID public key for browser subscription."""
+    if not _VAPID_PUBLIC_KEY:
+        return _cors(JsonResponse({'error': 'VAPID keys not configured'}, status=404))
+    return _cors(JsonResponse({'public_key': _VAPID_PUBLIC_KEY}))
+
+
+@csrf_exempt
+def push_subscribe(request):
+    """
+    POST /model_app/push/subscribe
+    Body: { endpoint, keys: { p256dh, auth } }
+    Saves the browser push subscription.
+    """
+    if request.method == 'OPTIONS':
+        resp = JsonResponse({})
+        resp['Access-Control-Allow-Origin']  = '*'
+        resp['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        resp['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
+    if request.method != 'POST':
+        return _cors(JsonResponse({'error': 'POST only'}, status=405))
+
+    try:
+        body     = json.loads(request.body or '{}')
+        endpoint = body.get('endpoint', '').strip()
+        keys     = body.get('keys', {})
+        p256dh   = keys.get('p256dh', '').strip()
+        auth     = keys.get('auth',   '').strip()
+
+        if not endpoint or not p256dh or not auth:
+            return _cors(JsonResponse({'error': 'endpoint, keys.p256dh and keys.auth required'}, status=400))
+
+        try:
+            from model_app.models import PushSubscription
+        except ImportError:
+            from .models import PushSubscription
+
+        ua = request.META.get('HTTP_USER_AGENT', '')[:255]
+        obj, created = PushSubscription.objects.update_or_create(
+            endpoint=endpoint,
+            defaults={'p256dh': p256dh, 'auth': auth, 'user_agent': ua, 'last_used_at': time.time()},
+        )
+        logger.info('Push subscription %s: %s', 'registered' if created else 'refreshed', endpoint[:60])
+        return _cors(JsonResponse({'status': 'subscribed', 'created': created}))
+
+    except Exception as exc:
+        logger.warning('push_subscribe error: %s', exc)
+        return _cors(JsonResponse({'error': str(exc)}, status=500))
+
+
+@csrf_exempt
+def push_unsubscribe(request):
+    """
+    POST /model_app/push/unsubscribe
+    Body: { endpoint }
+    Removes the push subscription from the DB.
+    """
+    if request.method == 'OPTIONS':
+        resp = JsonResponse({})
+        resp['Access-Control-Allow-Origin']  = '*'
+        resp['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        resp['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
+    if request.method != 'POST':
+        return _cors(JsonResponse({'error': 'POST only'}, status=405))
+
+    try:
+        body     = json.loads(request.body or '{}')
+        endpoint = body.get('endpoint', '').strip()
+        if not endpoint:
+            return _cors(JsonResponse({'error': 'endpoint required'}, status=400))
+
+        try:
+            from model_app.models import PushSubscription
+        except ImportError:
+            from .models import PushSubscription
+
+        deleted, _ = PushSubscription.objects.filter(endpoint=endpoint).delete()
+        return _cors(JsonResponse({'status': 'unsubscribed', 'deleted': deleted}))
+
+    except Exception as exc:
+        return _cors(JsonResponse({'error': str(exc)}, status=500))
