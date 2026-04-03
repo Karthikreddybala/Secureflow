@@ -668,6 +668,102 @@ class HotspotDeviceTracker:
         threading.Thread(target=self._neighbor_poller, daemon=True).start()
         # Background: mark devices offline when they leave the neighbor table
         threading.Thread(target=self._staleness_checker, daemon=True).start()
+        # Background: direct in-process Scapy capture for per-device bandwidth.
+        # This is the PRIMARY bandwidth accounting path — it works even when
+        # pp.py's hotspot sniffer silently fails (wrong iface name / Npcap issue).
+        threading.Thread(target=self._bw_capture_loop, daemon=True).start()
+
+    # ── Direct in-process bandwidth capture ──────────────────────────────────
+
+    def _find_hotspot_iface_name(self) -> str | None:
+        """Find the Windows Mobile Hotspot adapter name.
+
+        Strategy 1 — netsh (most reliable: works even when Scapy can't enumerate IPs):
+          Parse 'netsh interface ip show addresses' and return the interface
+          whose IP is in the 192.168.137.0/24 subnet.
+
+        Strategy 2 — Scapy interface list: scan for whichever adapter has a
+          192.168.137.x address in its IP list.
+        """
+        import re as _re
+        # ── Strategy 1: netsh ────────────────────────────────────────────────
+        try:
+            out = subprocess.run(
+                ['netsh', 'interface', 'ip', 'show', 'addresses'],
+                capture_output=True, text=True, timeout=6
+            ).stdout
+            current: str | None = None
+            for line in out.splitlines():
+                m = _re.search(r'Configuration for interface\s+"(.+?)"', line)
+                if m:
+                    current = m.group(1)
+                    continue
+                if current and '192.168.137.' in line and 'IP Address' in line:
+                    logger.info('BW-capture: hotspot adapter found via netsh → "%s"', current)
+                    return current
+        except Exception as exc:
+            logger.debug('BW-capture netsh probe failed: %s', exc)
+
+        # ── Strategy 2: Scapy interface list ────────────────────────────────
+        try:
+            from scapy.arch.windows import get_windows_if_list
+            for iface in get_windows_if_list():
+                ips = iface.get('ips', [])
+                if any(ip.startswith('192.168.137.') for ip in ips):
+                    name = iface.get('name', '')
+                    logger.info('BW-capture: hotspot adapter found via Scapy → "%s"', name)
+                    return name
+        except Exception as exc:
+            logger.debug('BW-capture Scapy probe failed: %s', exc)
+
+        logger.warning('BW-capture: hotspot adapter not found — per-device bandwidth will stay 0')
+        return None
+
+    def _bw_packet_cb(self, pkt):
+        """Scapy per-packet callback — called from the capture thread."""
+        try:
+            from scapy.all import IP as _IP
+            if _IP not in pkt:
+                return
+            src   = pkt[_IP].src
+            dst   = pkt[_IP].dst
+            size  = len(pkt)
+            dport = int(pkt.dport) if hasattr(pkt, 'dport') and pkt.dport else 0
+            if _is_hotspot_ip(src) or _is_hotspot_ip(dst):
+                self.observe(src, dst, size, dport)
+        except Exception:
+            pass
+
+    def _bw_capture_loop(self):
+        """Dedicated bandwidth-capture loop — runs forever inside Django.
+
+        Finds the hotspot adapter, starts a Scapy sniff, and retries on error.
+        By running inside the same process as HotspotDeviceTracker we bypass
+        the pp.py → WebSocket → Django pipeline entirely, guaranteeing that
+        bytes_up / bytes_down update for every connected device.
+        """
+        # Brief startup delay so Django finishes loading before we try Scapy
+        time.sleep(5)
+
+        iface = self._find_hotspot_iface_name()
+        if not iface:
+            return   # No hotspot adapter → nothing to do
+
+        from scapy.all import sniff as _sniff
+        logger.info('BW-capture: starting direct hotspot capture on "%s"', iface)
+
+        while True:
+            try:
+                _sniff(
+                    iface=iface,
+                    store=False,
+                    prn=self._bw_packet_cb,
+                    # Never stop voluntarily — loop runs until Django exits
+                    stop_filter=lambda _: False,
+                )
+            except Exception as exc:
+                logger.warning('BW-capture: sniffer crashed (%s) — retrying in 15 s', exc)
+                time.sleep(15)
 
     def observe(self, src: str, dst: str, pkt_size: int, dport: int):
         """Called for every packet from the hotspot adapter.
@@ -1112,23 +1208,23 @@ def _ingest_packet_locked(packet):
     flow['last'] = now
 
     # ── Hotspot device bandwidth tracking ─────────────────────────────────────
-    # Dual-path tracking:
-    #   'hotspot' tag  → full bidirectional accounting (client-side)
-    #   'wifi' tag     → update EXISTING clients' download counters (NAT reflection)
-    #   '' / 'pcap'   → treated same as hotspot (PCAP replay compatibility)
+    # Architecture:
+    #   'hotspot' tag → full bidirectional per-device accounting (upload + download)
+    #   'wifi' tag    → Wi-Fi adapter sees only NAT-translated IPs (laptop's public
+    #                   IP, not 192.168.137.x) so it CANNOT attribute traffic to
+    #                   individual hotspot clients — skip device tracking entirely.
+    #   '' / 'pcap'  → treated same as hotspot for PCAP replay compatibility.
     source_iface = packet.get('source_iface', '')
     src   = str(packet.get('src', ''))
     dst   = str(packet.get('dst', ''))
     dport = int(packet.get('dport', 0))
 
-    if source_iface == 'wifi':
-        # Wi-Fi NIC sees internet↔client traffic through NAT.
-        # Only update known device records — discovery is ARP-based, not flow-based.
-        _hotspot_tracker.observe_wifi(src, dst, packet_size, dport)
-    else:
-        # Hotspot adapter or PCAP: full bidirectional bandwidth accounting.
+    if source_iface != 'wifi':
+        # Only hotspot-adapter packets carry 192.168.137.x IPs that can be
+        # attributed to specific connected devices.
         if _is_hotspot_ip(src) or _is_hotspot_ip(dst):
             _hotspot_tracker.observe(src, dst, packet_size, dport)
+    # wifi packets: used for system-wide ML/alerts only — no per-device tracking.
 
     return True
 

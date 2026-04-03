@@ -13,7 +13,7 @@ function fmt(ts) {
 }
 
 export default function DeviceEmails() {
-  const { user, isAdmin } = useAuth();
+  const {isAdmin } = useAuth();
   const [rules,    setRules]    = useState([]);
   const [devices,  setDevices]  = useState([]);
   const [loading,  setLoading]  = useState(true);
@@ -101,7 +101,9 @@ export default function DeviceEmails() {
         body: JSON.stringify({ enabled: !rule.enabled }),
       });
       refresh();
-    } catch {}
+    } catch {
+        setMsg({ type: 'err', text: 'Failed to update rule.' });
+    }
   };
 
   // ── Test email ────────────────────────────────────────────
