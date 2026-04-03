@@ -6,7 +6,7 @@ const ML_API = 'http://127.0.0.1:8000/model_app';
 
 const SEV_OPTIONS = ['Low', 'Medium', 'High'];
 const SEV_COLOR   = { Low: 'var(--success)', Medium: 'var(--warning)', High: 'var(--danger)' };
-
+// device mail
 function fmt(ts) {
   if (!ts) return '—';
   return new Date(ts * 1000).toLocaleString();
