@@ -172,8 +172,17 @@ class DeviceConsumer(AsyncWebsocketConsumer):
             await asyncio.sleep(2)
             try:
                 await self._send_snapshot()
-            except Exception:
-                break   # Client disconnected
+            except Exception as exc:
+                # Only stop on a genuine WebSocket close/disconnect error.
+                # Transient errors (e.g. serialisation blip) must not kill the
+                # loop — if they did, the WS would stay "open" but silent,
+                # preventing the frontend from falling back to REST polling.
+                err = str(exc).lower()
+                if any(k in err for k in ('closed', 'disconnect', 'going away',
+                                          'connection reset', 'websocket')):
+                    logger.debug('DeviceConsumer: WS closed, stopping push: %s', exc)
+                    break
+                logger.debug('DeviceConsumer: transient push error, continuing: %s', exc)
 
     async def send_devices(self, event):
         """Handle group broadcast from _push_device_update()."""

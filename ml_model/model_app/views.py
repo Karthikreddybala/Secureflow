@@ -155,15 +155,439 @@ else:
 
 # ── MITRE ATT&CK mapping ───────────────────────────────────────────────────────
 ATTACK_TO_MITRE: dict[str, dict] = {
-    'DoS':         {'id': 'T1498',     'name': 'Network Denial of Service',   'tactic': 'Impact'},
-    'DDoS':        {'id': 'T1498.001', 'name': 'Direct Network Flood',        'tactic': 'Impact'},
-    'PortScan':    {'id': 'T1046',     'name': 'Network Service Discovery',   'tactic': 'Discovery'},
-    'BruteForce':  {'id': 'T1110',     'name': 'Brute Force',                 'tactic': 'Credential Access'},
-    'Botnet':      {'id': 'T1071',     'name': 'Application Layer Protocol',  'tactic': 'Command & Control'},
-    'Infiltration':{'id': 'T1190',     'name': 'Exploit Public-Facing App',   'tactic': 'Initial Access'},
-    'Heartbleed':  {'id': 'T1203',     'name': 'Exploitation for Client Exec','tactic': 'Execution'},
-    'Anomaly':     {'id': 'T1499',     'name': 'Endpoint Denial of Service',  'tactic': 'Impact'},
+    'DoS':              {'id': 'T1498',     'name': 'Network Denial of Service',   'tactic': 'Impact'},
+    'DDoS':             {'id': 'T1498.001', 'name': 'Direct Network Flood',        'tactic': 'Impact'},
+    'PortScan':         {'id': 'T1046',     'name': 'Network Service Discovery',   'tactic': 'Discovery'},
+    'BruteForce':       {'id': 'T1110',     'name': 'Brute Force',                 'tactic': 'Credential Access'},
+    'SSHBruteForce':    {'id': 'T1110.004', 'name': 'SSH Credential Stuffing',     'tactic': 'Credential Access'},
+    'RDPBruteForce':    {'id': 'T1110.001', 'name': 'Password Guessing via RDP',   'tactic': 'Credential Access'},
+    'SYNFlood':         {'id': 'T1498.001', 'name': 'SYN Flood',                   'tactic': 'Impact'},
+    'XmasScan':         {'id': 'T1046',     'name': 'Xmas Tree Port Scan',         'tactic': 'Discovery'},
+    'NullScan':         {'id': 'T1046',     'name': 'Null Scan (OS Fingerprint)',   'tactic': 'Discovery'},
+    'FINScan':          {'id': 'T1046',     'name': 'FIN Scan (Stealth Probe)',     'tactic': 'Discovery'},
+    'ICMPFlood':        {'id': 'T1498',     'name': 'ICMP Flood',                  'tactic': 'Impact'},
+    'HTTPFlood':        {'id': 'T1499.002', 'name': 'HTTP/HTTPS Flood',            'tactic': 'Impact'},
+    'DNSExfiltration':  {'id': 'T1048.003', 'name': 'DNS Tunneling Exfiltration',  'tactic': 'Exfiltration'},
+    'C2Beacon':         {'id': 'T1071',     'name': 'C2 Application Protocol',     'tactic': 'Command & Control'},
+    'CredStuffing':     {'id': 'T1110.004', 'name': 'Credential Stuffing',         'tactic': 'Credential Access'},
+    'Botnet':           {'id': 'T1071',     'name': 'Application Layer Protocol',  'tactic': 'Command & Control'},
+    'Infiltration':     {'id': 'T1190',     'name': 'Exploit Public-Facing App',   'tactic': 'Initial Access'},
+    'Heartbleed':       {'id': 'T1203',     'name': 'Exploitation for Client Exec','tactic': 'Execution'},
+    'Anomaly':          {'id': 'T1499',     'name': 'Endpoint Denial of Service',  'tactic': 'Impact'},
 }
+
+# ── Trusted IP Whitelist (never alert on these — DNS resolvers, CDN, NTP) ──────
+WHITELIST_IPS: set[str] = {
+    '8.8.8.8', '8.8.4.4',               # Google DNS
+    '1.1.1.1', '1.0.0.1',               # Cloudflare DNS
+    '9.9.9.9', '149.112.112.112',        # Quad9 DNS
+    '208.67.222.222', '208.67.220.220',  # OpenDNS
+    '216.58.0.0',                        # Google (block)
+    '192.168.137.1',                     # Hotspot gateway — never self-alert
+}
+
+# ── Known C2 / malware ports ───────────────────────────────────────────────────
+_C2_PORTS: frozenset[int] = frozenset({
+    4444,   # Metasploit default
+    4445,   # Metasploit alt
+    1337,   # leet / hackers
+    31337,  # Back Orifice / leet
+    6667, 6668, 6669,  # IRC botnet C2
+    8080,   # proxy / C2 alt (only flagged if unusual pattern)
+    9999,   # common reverse shell
+    12345,  # NetBus RAT
+    27374,  # SubSeven RAT
+    65535,  # common test C2
+})
+
+# ── Alert Dedup Cache ─────────────────────────────────────────────────────────
+# Suppress duplicate (src_ip, attack_type) alerts within DEDUP_WINDOW seconds.
+_dedup_cache: dict[tuple, float] = {}   # (src_ip, attack_type) → last_alerted_ts
+_dedup_lock  = threading.Lock()
+DEDUP_WINDOW = 60.0  # seconds
+
+def _should_suppress(src_ip: str, attack_type: str) -> bool:
+    """Return True if this exact (src, attack) was already alerted within DEDUP_WINDOW."""
+    if src_ip in WHITELIST_IPS:
+        return True
+    key = (src_ip, attack_type)
+    now = time.time()
+    with _dedup_lock:
+        last = _dedup_cache.get(key, 0.0)
+        if now - last < DEDUP_WINDOW:
+            return True
+        _dedup_cache[key] = now
+    return False
+
+# Periodic cleanup of stale dedup entries
+def _dedup_cleanup():
+    while True:
+        time.sleep(120)
+        now = time.time()
+        with _dedup_lock:
+            stale = [k for k, v in _dedup_cache.items() if now - v > DEDUP_WINDOW * 3]
+            for k in stale:
+                del _dedup_cache[k]
+
+threading.Thread(target=_dedup_cleanup, daemon=True).start()
+
+# ── Suricata-Style Deterministic Rule Engine ───────────────────────────────────
+# Tracks per-source-IP sliding-window state for stateful rule detection.
+# This runs on EVERY PACKET — before flow completion — enabling sub-second detection.
+
+RULE_WINDOW       = 30.0  # seconds — sliding window for most rate rules
+RULE_WINDOW_SHORT =  5.0  # seconds — for high-speed floods
+
+# Per-ip state dict structure:
+# {
+#   'syn_targets':     set of (ts, dport) — for port scan
+#   'syn_ts':         list of timestamps  — for SYN flood
+#   'ssh_ts':         list of timestamps  — SSH brute-force
+#   'rdp_ts':         list of timestamps  — RDP brute-force
+#   'http_ts':        list of timestamps  — HTTP flood
+#   'icmp_ts':        list of timestamps  — ICMP flood
+#   'dns_ts':         list of timestamps  — DNS exfiltration
+#   'rst_after_syn':  int                 — credential stuffing RST count
+#   'rst_ts':         list of timestamps
+#   'c2_hits':        int                 — C2 port matches
+# }
+_rule_state: dict[str, dict] = {}
+_rule_lock  = threading.Lock()
+
+def _rule_state_for(ip: str) -> dict:
+    """Get-or-create the rule state dict for an IP (must be called under _rule_lock)."""
+    if ip not in _rule_state:
+        _rule_state[ip] = {
+            'syn_targets': set(),
+            'syn_ts':      [],
+            'ssh_ts':      [],
+            'rdp_ts':      [],
+            'http_ts':     [],
+            'icmp_ts':     [],
+            'dns_ts':      [],
+            'rst_ts':      [],
+            'c2_hits':     0,
+            'c2_last':     0.0,
+        }
+    return _rule_state[ip]
+
+def _prune_ts(ts_list: list, now: float, window: float) -> list:
+    """In-place prune timestamps older than window; returns same list."""
+    cutoff = now - window
+    ts_list[:] = [t for t in ts_list if t >= cutoff]
+    return ts_list
+
+def _prune_syn_targets(targets: set, now: float, window: float) -> set:
+    """Remove (ts, port) pairs older than window."""
+    cutoff = now - window
+    targets -= {(t, p) for t, p in targets if t < cutoff}
+    return targets
+
+
+def _fire_rule_alert(src_ip: str, dst_ip: str, sport, dport,
+                     protocol: str, attack_type: str, severity: str,
+                     detail: str = '', rule_score: float = 95.0,
+                     is_simulated: bool = False):
+    """
+    Emit a deterministic rule-based alert immediately, bypassing the ML flow pipeline.
+    Rule alerts fire in real-time (per-packet) — no need to wait for flow completion.
+    """
+    if _should_suppress(src_ip, attack_type):
+        return
+
+    mitre = ATTACK_TO_MITRE.get(attack_type, {})
+    abuse = abuse_ipdb.get_abuse_score(src_ip)
+
+    alert = {
+        'final': {
+            'final_score':  rule_score,
+            'attack_type':  attack_type,
+            'severity':     severity,
+        },
+        'protocol':     protocol,
+        'src_ip':       src_ip,
+        'dst_ip':       dst_ip,
+        'sport':        str(sport),
+        'dport':        str(dport),
+        'timestamp':    time.time(),
+        'mitre':        mitre,
+        'shap':         [],
+        'abuse_score':  abuse,
+        'abuse_badge':  abuse_ipdb.badge(abuse),
+        'message':      f'[RULE] {attack_type}: {detail}',
+        'rule_triggered': True,
+        'is_simulated': is_simulated,
+    }
+
+    # Host threat score
+    _update_host_score(src_ip, severity, attack_type)
+
+    # Incident correlation
+    incident = incident_engine.correlate_alert(alert)
+    if incident:
+        alert['incident_id'] = incident['id']
+
+    # In-memory store for export
+    global _recent_alerts
+    _recent_alerts = (_recent_alerts + [alert])[-_MAX_RECENT:]
+
+    # Persist to DB
+    try:
+        f = alert['final']
+        m = alert.get('mitre', {})
+        AlertRecord.objects.create(
+            timestamp    = alert['timestamp'],
+            src_ip       = src_ip or None,
+            dst_ip       = dst_ip or None,
+            sport        = str(sport) or None,
+            dport        = str(dport) or None,
+            protocol     = protocol,
+            attack_type  = f['attack_type'],
+            severity     = f['severity'],
+            confidence   = float(f['final_score']),
+            mitre_id     = m.get('id', ''),
+            mitre_tactic = m.get('tactic', ''),
+            abuse_score  = int(abuse),
+            incident_id  = str(alert.get('incident_id', '')),
+            is_simulated = is_simulated,
+        )
+    except Exception as _db_err:
+        logger.debug('Rule alert DB write failed: %s', _db_err)
+
+    # Email + push for Medium/High hotspot alerts
+    if severity in ('Medium', 'High') and _is_hotspot_ip(src_ip):
+        _dev_mac = ''
+        try:
+            with _hotspot_tracker._lock:
+                _dev_rec = _hotspot_tracker._devices.get(src_ip)
+                if _dev_rec:
+                    _dev_mac = _dev_rec.mac
+        except Exception:
+            pass
+        _send_device_alert_email(src_ip, _dev_mac, alert)
+    _send_push_notifications(alert)
+
+    # Broadcast via WebSocket immediately
+    try:
+        async_to_sync(send_alert_async)(alert)
+    except Exception as _ws_err:
+        logger.debug('Rule alert WS push failed: %s', _ws_err)
+
+    processing_stats['alerts_emitted'] += 1
+    logger.info('[RULE] %s | src=%s dst=%s:%s sev=%s score=%.0f detail=%s',
+                attack_type, src_ip, dst_ip, dport, severity, rule_score, detail)
+
+
+def _rule_engine(src_ip: str, dst_ip: str, sport: int, dport: int,
+                 proto: int, flags: int, pkt_size: int,
+                 is_simulated: bool = False):
+    """
+    Suricata-style per-packet rule engine.
+    Called on EVERY ingested packet — fires deterministic signatures in real-time.
+    Operates entirely outside the ML flow pipeline.
+
+    Rules implemented:
+      1. PortScan         — SYN to ≥30 unique ports in 30s
+      2. SYNFlood         — >50 SYN/s from one IP (5s window)
+      3. XmasScan         — FIN+PSH+URG set simultaneously
+      4. NullScan         — all flags = 0 on TCP packet
+      5. FINScan          — FIN-only TCP
+      6. SSHBruteForce    — >10 connections to :22 in 30s
+      7. RDPBruteForce    — >10 connections to :3389 in 30s
+      8. HTTPFlood        — >100 SYN connections to :80/:443 in 10s
+      9. ICMPFlood        — >100 ICMP packets in 5s
+     10. DNSExfiltration  — >20 DNS queries in 5s OR single DNS pkt >200 bytes
+     11. C2Beacon         — traffic to known C2 ports
+     12. CredStuffing     — >20 RST after SYN in 30s (failed connection storm)
+    """
+    if src_ip in WHITELIST_IPS or dst_ip in WHITELIST_IPS:
+        return
+    if not src_ip or src_ip == 'unknown':
+        return
+
+    now       = time.time()
+    proto_str = {6: 'TCP', 17: 'UDP', 1: 'ICMP'}.get(proto, str(proto))
+
+    with _rule_lock:
+        st = _rule_state_for(src_ip)
+
+        # ── Rule 3: Xmas Scan ─────────────────────────────────────────────────
+        if proto == 6 and (flags & (_FIN | _PSH | _URG)) == (_FIN | _PSH | _URG):
+            _fire_rule_alert(
+                src_ip, dst_ip, sport, dport, proto_str,
+                'XmasScan', 'High', f'Xmas flags to port {dport}',
+                rule_score=96.0, is_simulated=is_simulated
+            )
+            return
+
+        # ── Rule 4: Null Scan ─────────────────────────────────────────────────
+        if proto == 6 and flags == 0:
+            _fire_rule_alert(
+                src_ip, dst_ip, sport, dport, proto_str,
+                'NullScan', 'High', f'Null flags on TCP to port {dport}',
+                rule_score=95.0, is_simulated=is_simulated
+            )
+            return
+
+        # ── Rule 5: FIN Scan ──────────────────────────────────────────────────
+        if proto == 6 and flags == _FIN:
+            _fire_rule_alert(
+                src_ip, dst_ip, sport, dport, proto_str,
+                'FINScan', 'Medium', f'FIN-only scan to port {dport}',
+                rule_score=88.0, is_simulated=is_simulated
+            )
+            return
+
+        # ── Rule 9: ICMP Flood ────────────────────────────────────────────────
+        if proto == 1:  # ICMP
+            _prune_ts(st['icmp_ts'], now, RULE_WINDOW_SHORT)
+            st['icmp_ts'].append(now)
+            if len(st['icmp_ts']) > 100:
+                _fire_rule_alert(
+                    src_ip, dst_ip, sport, dport, 'ICMP',
+                    'ICMPFlood', 'High',
+                    f'{len(st["icmp_ts"])} ICMP pkts in {RULE_WINDOW_SHORT:.0f}s',
+                    rule_score=92.0, is_simulated=is_simulated
+                )
+                st['icmp_ts'].clear()
+            return
+
+        # ── Rule 10: DNS Exfiltration ─────────────────────────────────────────
+        if dport == 53 or sport == 53:
+            _prune_ts(st['dns_ts'], now, RULE_WINDOW_SHORT)
+            st['dns_ts'].append(now)
+            if len(st['dns_ts']) > 20:
+                _fire_rule_alert(
+                    src_ip, dst_ip, sport, dport, 'UDP',
+                    'DNSExfiltration', 'High',
+                    f'{len(st["dns_ts"])} DNS queries in {RULE_WINDOW_SHORT:.0f}s',
+                    rule_score=90.0, is_simulated=is_simulated
+                )
+                st['dns_ts'].clear()
+            elif pkt_size > 200 and dport == 53:
+                _fire_rule_alert(
+                    src_ip, dst_ip, sport, dport, 'UDP',
+                    'DNSExfiltration', 'Medium',
+                    f'Oversized DNS query: {pkt_size}B',
+                    rule_score=82.0, is_simulated=is_simulated
+                )
+            return
+
+        # ── Rule 11: C2 Port Beacon ───────────────────────────────────────────
+        if dport in _C2_PORTS:
+            # Only alert once per 120s per (src, port) to avoid spam
+            c2_key = (src_ip, dport)
+            # We use a simple time gate stored per-IP
+            if now - st.get('c2_last', 0.0) > 120:
+                st['c2_last'] = now
+                _fire_rule_alert(
+                    src_ip, dst_ip, sport, dport, proto_str,
+                    'C2Beacon', 'High',
+                    f'Traffic to known C2 port {dport}',
+                    rule_score=97.0, is_simulated=is_simulated
+                )
+            return
+
+        # From here: TCP-only rules that use flags
+        if proto != 6:
+            return
+
+        is_syn_only = (flags & _SYN) and not (flags & _ACK)
+        is_syn_ack  = (flags & _SYN) and (flags & _ACK)
+        is_rst      = bool(flags & _RST)
+
+        # ── Rule 1: Port Scan ─────────────────────────────────────────────────
+        if is_syn_only:
+            _prune_syn_targets(st['syn_targets'], now, RULE_WINDOW)
+            st['syn_targets'].add((now, dport))
+            unique_ports = len({p for _, p in st['syn_targets']})
+            if unique_ports >= 30:
+                _fire_rule_alert(
+                    src_ip, dst_ip, sport, dport, 'TCP',
+                    'PortScan', 'High',
+                    f'{unique_ports} unique ports SYN-scanned in {RULE_WINDOW:.0f}s',
+                    rule_score=95.0, is_simulated=is_simulated
+                )
+                st['syn_targets'].clear()
+
+        # ── Rule 2: SYN Flood ─────────────────────────────────────────────────
+        if is_syn_only:
+            _prune_ts(st['syn_ts'], now, RULE_WINDOW_SHORT)
+            st['syn_ts'].append(now)
+            if len(st['syn_ts']) > 50:
+                _fire_rule_alert(
+                    src_ip, dst_ip, sport, dport, 'TCP',
+                    'SYNFlood', 'High',
+                    f'{len(st["syn_ts"])} SYN pkts in {RULE_WINDOW_SHORT:.0f}s',
+                    rule_score=98.0, is_simulated=is_simulated
+                )
+                st['syn_ts'].clear()
+
+        # ── Rule 6: SSH Brute-Force ───────────────────────────────────────────
+        if dport == 22 and is_syn_only:
+            _prune_ts(st['ssh_ts'], now, RULE_WINDOW)
+            st['ssh_ts'].append(now)
+            if len(st['ssh_ts']) > 10:
+                _fire_rule_alert(
+                    src_ip, dst_ip, sport, 22, 'TCP',
+                    'SSHBruteForce', 'High',
+                    f'{len(st["ssh_ts"])} SSH connections in {RULE_WINDOW:.0f}s',
+                    rule_score=93.0, is_simulated=is_simulated
+                )
+                st['ssh_ts'].clear()
+
+        # ── Rule 7: RDP Brute-Force ───────────────────────────────────────────
+        if dport == 3389 and is_syn_only:
+            _prune_ts(st['rdp_ts'], now, RULE_WINDOW)
+            st['rdp_ts'].append(now)
+            if len(st['rdp_ts']) > 10:
+                _fire_rule_alert(
+                    src_ip, dst_ip, sport, 3389, 'TCP',
+                    'RDPBruteForce', 'High',
+                    f'{len(st["rdp_ts"])} RDP connections in {RULE_WINDOW:.0f}s',
+                    rule_score=93.0, is_simulated=is_simulated
+                )
+                st['rdp_ts'].clear()
+
+        # ── Rule 8: HTTP Flood ────────────────────────────────────────────────
+        if dport in (80, 443, 8080, 8443) and is_syn_only:
+            _prune_ts(st['http_ts'], now, 10.0)
+            st['http_ts'].append(now)
+            if len(st['http_ts']) > 100:
+                _fire_rule_alert(
+                    src_ip, dst_ip, sport, dport, 'TCP',
+                    'HTTPFlood', 'High',
+                    f'{len(st["http_ts"])} HTTP/S connections in 10s',
+                    rule_score=92.0, is_simulated=is_simulated
+                )
+                st['http_ts'].clear()
+
+        # ── Rule 12: Credential Stuffing (RST storm) ──────────────────────────
+        if is_rst:
+            _prune_ts(st['rst_ts'], now, RULE_WINDOW)
+            st['rst_ts'].append(now)
+            if len(st['rst_ts']) > 20:
+                _fire_rule_alert(
+                    src_ip, dst_ip, sport, dport, 'TCP',
+                    'CredStuffing', 'Medium',
+                    f'{len(st["rst_ts"])} RST pkts in {RULE_WINDOW:.0f}s (failed connection storm)',
+                    rule_score=80.0, is_simulated=is_simulated
+                )
+                st['rst_ts'].clear()
+
+# Periodic cleanup of stale rule state (hosts that haven't sent a packet in 5 min)
+def _rule_state_cleanup():
+    while True:
+        time.sleep(300)
+        now = time.time()
+        with _rule_lock:
+            stale = [ip for ip, st in _rule_state.items()
+                     if not st['syn_ts'] and not st['syn_targets']
+                     and not st['ssh_ts'] and not st['icmp_ts']]
+            for ip in stale:
+                del _rule_state[ip]
+
+threading.Thread(target=_rule_state_cleanup, daemon=True).start()
 
 # ── SHAP explainer (initialised after model load) ──────────────────────────────
 _shap_explainer = None
@@ -668,6 +1092,175 @@ class HotspotDeviceTracker:
         threading.Thread(target=self._neighbor_poller, daemon=True).start()
         # Background: mark devices offline when they leave the neighbor table
         threading.Thread(target=self._staleness_checker, daemon=True).start()
+        # Background: direct in-process Scapy capture for per-device bandwidth.
+        # This is the PRIMARY bandwidth accounting path — it works even when
+        # pp.py's hotspot sniffer silently fails (wrong iface name / Npcap issue).
+        threading.Thread(target=self._bw_capture_loop, daemon=True).start()
+
+    # ── Direct in-process bandwidth capture ──────────────────────────────────
+
+    def _find_hotspot_iface_name(self) -> str | None:
+        """Find the Windows Mobile Hotspot adapter name.
+
+        Strategy 0 (PowerShell — most reliable on all Windows locales):
+          Get-NetIPAddress returns exact InterfaceAlias with no parsing ambiguity.
+
+        Strategy 1 — netsh:
+          Parse 'netsh interface ip show addresses'. Reliable but locale-dependent.
+
+        Strategy 2 — Scapy interface list:
+          Scan for whichever adapter has 192.168.137.x in its IP list.
+        """
+        import re as _re
+
+        # ── Strategy 0: PowerShell Get-NetIPAddress (fastest + locale-safe) ──────
+        try:
+            out = subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 'Get-NetIPAddress -AddressFamily IPv4 '
+                 '| Where-Object { $_.IPAddress -like "192.168.137.*" } '
+                 '| Select-Object -ExpandProperty InterfaceAlias '
+                 '| Select-Object -First 1'],
+                capture_output=True, text=True, timeout=8
+            ).stdout.strip()
+            if out:
+                logger.info('BW-capture: hotspot adapter found via PowerShell → "%s"', out)
+                return out
+        except Exception as exc:
+            logger.debug('BW-capture PowerShell probe failed: %s', exc)
+
+        # ── Strategy 1: netsh ────────────────────────────────────────────────────
+        try:
+            out = subprocess.run(
+                ['netsh', 'interface', 'ip', 'show', 'addresses'],
+                capture_output=True, text=True, timeout=6
+            ).stdout
+            current: str | None = None
+            for line in out.splitlines():
+                m = _re.search(r'Configuration for interface\s+"(.+?)"', line)
+                if m:
+                    current = m.group(1)
+                    continue
+                if current and '192.168.137.' in line and 'IP Address' in line:
+                    logger.info('BW-capture: hotspot adapter found via netsh → "%s"', current)
+                    return current
+        except Exception as exc:
+            logger.debug('BW-capture netsh probe failed: %s', exc)
+
+        # ── Strategy 2: Scapy interface list ──────────────────────────────────────────
+        try:
+            from scapy.arch.windows import get_windows_if_list
+            for iface in get_windows_if_list():
+                ips = iface.get('ips', [])
+                if any(ip.startswith('192.168.137.') for ip in ips):
+                    name = iface.get('name', '')
+                    logger.info('BW-capture: hotspot adapter found via Scapy → "%s"', name)
+                    return name
+        except Exception as exc:
+            logger.debug('BW-capture Scapy probe failed: %s', exc)
+
+        logger.warning(
+            'BW-capture: hotspot adapter not found — ensure Mobile Hotspot is '
+            'enabled in Windows Settings. Per-device bandwidth will stay 0 until '
+            'hotspot is active.'
+        )
+        return None
+
+    def _bw_packet_cb(self, pkt):
+        """Scapy per-packet callback for the in-process BW capture thread.
+
+        Does two things:
+          1. Updates per-device bytes_up / bytes_down in HotspotDeviceTracker.
+          2. Feeds the packet into the ML/rule-engine pipeline (same as pp.py)
+             so attacks FROM hotspot devices are detected even without pp.py.
+        """
+        try:
+            from scapy.all import IP as _IP, TCP as _TCP, UDP as _UDP
+            if _IP not in pkt:
+                return
+            src   = pkt[_IP].src
+            dst   = pkt[_IP].dst
+            size  = len(pkt)
+            proto = pkt[_IP].proto
+            dport = 0
+            sport = 0
+            flags = 0
+            ip_hdr = pkt[_IP].ihl * 4
+            tcp_hdr = 0
+
+            if _TCP in pkt:
+                sport   = int(pkt[_TCP].sport)
+                dport   = int(pkt[_TCP].dport)
+                flags   = int(pkt[_TCP].flags)
+                tcp_hdr = pkt[_TCP].dataofs * 4
+            elif _UDP in pkt:
+                sport = int(pkt[_UDP].sport)
+                dport = int(pkt[_UDP].dport)
+
+            # 1. Per-device bandwidth accounting
+            if _is_hotspot_ip(src) or _is_hotspot_ip(dst):
+                self.observe(src, dst, size, dport)
+
+            # 2. Feed into ML + rule engine pipeline
+            #    This ensures hotspot device traffic triggers IDS rules and alerts
+            #    even when pp.py is not running or its WS connection drops.
+            packet_info = {
+                'timestamp':    time.time(),
+                'src':          src,
+                'dst':          dst,
+                'sport':        sport,
+                'dport':        dport,
+                'proto':        proto,
+                'size':         size,
+                'ip_hdr_len':   ip_hdr,
+                'tcp_hdr_len':  tcp_hdr,
+                'flags':        flags,
+                'source_iface': 'hotspot',   # always hotspot adapter
+            }
+            # Use non-blocking put so a slow queue never blocks capture
+            try:
+                _bw_packet_queue.put_nowait(packet_info)
+            except Exception:
+                pass  # queue full — drop silently
+
+        except Exception:
+            pass
+
+    def _bw_capture_loop(self):
+        """Dedicated bandwidth-capture loop — runs forever inside Django.
+
+        Finds the hotspot adapter by name (PowerShell/netsh/Scapy), starts a
+        Scapy sniff, and retries on error.  If the hotspot adapter disappears
+        (user toggled hotspot off), it re-probes every 30s until it comes back.
+
+        Guarantees that bytes_up / bytes_down update for every connected device
+        INDEPENDENT of whether pp.py / WebSocket is running.
+        """
+        # Brief startup delay so Django finishes loading before we try Scapy
+        time.sleep(5)
+
+        from scapy.all import sniff as _sniff
+
+        while True:
+            iface = self._find_hotspot_iface_name()
+            if not iface:
+                # Hotspot not active yet — wait and retry
+                logger.info('BW-capture: hotspot not found, retrying in 30s …')
+                time.sleep(30)
+                continue
+
+            logger.info('BW-capture: starting on "%s"', iface)
+            try:
+                _sniff(
+                    iface=iface,
+                    store=False,
+                    prn=self._bw_packet_cb,
+                    stop_filter=lambda _: False,
+                )
+            except Exception as exc:
+                logger.warning('BW-capture crashed (%s) — re-detecting interface in 10s', exc)
+                time.sleep(10)
+                # Loop back → re-detect interface (hotspot adapter name can change)
 
     def observe(self, src: str, dst: str, pkt_size: int, dport: int):
         """Called for every packet from the hotspot adapter.
@@ -960,6 +1553,28 @@ _hotspot_tracker = HotspotDeviceTracker()
 flows      = {}
 flows_lock = threading.Lock()
 
+# ── BW-capture → ML pipeline queue ────────────────────────────────────────────
+# The in-process hotspot Scapy sniffer feeds packets here.
+# A background thread drains the queue and calls process_packet() so:
+#   • All 12 Suricata-style rules fire on real hotspot traffic in real-time
+#   • ML flow features accumulate from real packets (not just simulated ones)
+#   • Bandwidth + ML detection both run from the SAME packet stream
+import queue as _queue
+_bw_packet_queue: _queue.Queue = _queue.Queue(maxsize=10_000)
+
+def _bw_queue_consumer():
+    """Drain hotspot packets into the ML/rule engine pipeline."""
+    while True:
+        try:
+            pkt_info = _bw_packet_queue.get(timeout=1.0)
+            process_packet(pkt_info)   # ingest into flow table + rule engine
+        except _queue.Empty:
+            continue
+        except Exception as exc:
+            logger.debug('BW queue consumer error: %s', exc)
+
+threading.Thread(target=_bw_queue_consumer, daemon=True, name='bw-queue-consumer').start()
+
 processing_stats = {
     'flows_processed':        0,
     'packets_processed':      0,
@@ -1006,27 +1621,82 @@ def _flow_id(packet):
         return (dst, src, dp, sp, proto)
 
 
-# ── Fusion engine ──────────────────────────────────────────────────────────────
-def fusion_engine(rf_label, rf_confidence, iso_score):
-    if str(rf_label).lower() != 'normal':
-        severity = 'High' if rf_confidence >= 0.80 else 'Medium'
-        return {
-            'final_score': round(min(MAX_Y_ALERT_SCORE, rf_confidence * 100.0), 2),
-            'attack_type': str(rf_label),
-            'severity':    severity,
-        }
+# ── Fusion engine v2 ─────────────────────────────────────────────────────────
+# Suricata-style multi-layer weighted scoring:
+#   ML classifier  (50%)  — XGBoost / RF label + calibrated confidence
+#   Isolation Forest (20%) — unsupervised anomaly score
+#   AbuseIPDB reputation (15%) — external threat intel
+#   Rule engine bonus (+25%) — deterministic rule fired ON THIS FLOW
+#   Host threat history (+10%) — repeat offender bump
+#
+# XGBoost raw probabilities are NOT calibrated — apply sigmoid correction.
+# A raw score of 0.80 from XGBoost ≈ 0.73 after calibration.
+def _calibrate(raw_prob: float) -> float:
+    """Sigmoid calibration for XGBoost / RF predict_proba scores."""
+    import math
+    try:
+        return 1.0 / (1.0 + math.exp(-4.0 * (raw_prob - 0.5)))
+    except OverflowError:
+        return 0.0 if raw_prob < 0.5 else 1.0
 
-    if iso_score > 0.25:
-        return {
-            'final_score': round(min(MAX_Y_ALERT_SCORE, iso_score * 100.0), 2),
-            'attack_type': 'Anomaly',
-            'severity':    'Medium',
-        }
+
+def fusion_engine(rf_label, rf_confidence, iso_score,
+                  abuse_score: int = 0,
+                  rule_hit: bool = False,
+                  host_score: float = 0.0):
+    """
+    Multi-layer fusion engine for SecureFlow IDS.
+    Returns dict with final_score (0-100), attack_type, severity.
+    """
+    label      = str(rf_label)
+    is_attack  = label.lower() not in ('normal', 'benign')
+    cal_conf   = _calibrate(float(rf_confidence))   # sigmoid-calibrated
+
+    # ── Base score components ─────────────────────────────────────────────────
+    ml_score    = cal_conf * 0.50 if is_attack else 0.0
+    iso_contrib = float(iso_score) * 0.20
+    rep_contrib = min(1.0, abuse_score / 100.0) * 0.15
+
+    base = ml_score + iso_contrib + rep_contrib
+
+    # ── Rule hit overrides — deterministic signatures take priority ───────────
+    if rule_hit:
+        base = min(1.0, base + 0.25)  # strong boost
+
+    # ── Repeat offender bump ──────────────────────────────────────────────────
+    if host_score > 50:
+        base = min(1.0, base + 0.10)
+
+    final_score = round(min(MAX_Y_ALERT_SCORE, base * 100.0), 2)
+
+    # ── Determine attack type -------------------------------------------------
+    if is_attack:
+        attack_type = label
+    elif iso_score > 0.25 or rule_hit:
+        attack_type = 'Anomaly'
+    else:
+        attack_type = 'Normal'
+
+    # ── Severity mapping ──────────────────────────────────────────────────────
+    if attack_type == 'Normal':
+        severity = 'Low'
+    elif rule_hit:
+        # Deterministic rules guarantee at least Medium
+        if final_score >= 90 or cal_conf >= 0.85:
+            severity = 'High'
+        else:
+            severity = 'Medium'
+    elif final_score >= 75 or (is_attack and cal_conf >= 0.80):
+        severity = 'High'
+    elif final_score >= 45 or is_attack or iso_score > 0.25:
+        severity = 'Medium'
+    else:
+        severity = 'Low'
 
     return {
-        'final_score': round(min(MAX_Y_ALERT_SCORE, iso_score * 100.0), 2),
-        'attack_type': 'Normal',
-        'severity':    'Low',
+        'final_score': final_score,
+        'attack_type': attack_type,
+        'severity':    severity,
     }
 
 
@@ -1076,6 +1746,8 @@ def _ingest_packet_locked(packet):
             'dport': fid[3],
             'first': now,
             'last':  now,
+            # protocol-level hints (accumulated per packet)
+            'proto_hints': {},   # e.g. {'dns_oversize': True, 'c2_port': True}
         }
         flows[fid] = flow
 
@@ -1083,9 +1755,15 @@ def _ingest_packet_locked(packet):
     flow['sizes'].append(packet_size)
 
     # Determine direction using canonical key
+    src   = str(packet.get('src', ''))
+    dst   = str(packet.get('dst', ''))
+    sport = str(packet.get('sport', ''))
+    dport_int = int(packet.get('dport', 0))
+    proto_int = int(packet.get('proto', 0))
+
     is_fwd = (
-        str(packet.get('src'))   == flow['canonical_fwd_src'] and
-        str(packet.get('sport')) == flow['canonical_fwd_sport']
+        src   == flow['canonical_fwd_src'] and
+        sport == flow['canonical_fwd_sport']
     )
 
     if is_fwd:
@@ -1111,24 +1789,44 @@ def _ingest_packet_locked(packet):
 
     flow['last'] = now
 
-    # ── Hotspot device bandwidth tracking ─────────────────────────────────────
-    # Dual-path tracking:
-    #   'hotspot' tag  → full bidirectional accounting (client-side)
-    #   'wifi' tag     → update EXISTING clients' download counters (NAT reflection)
-    #   '' / 'pcap'   → treated same as hotspot (PCAP replay compatibility)
-    source_iface = packet.get('source_iface', '')
-    src   = str(packet.get('src', ''))
-    dst   = str(packet.get('dst', ''))
-    dport = int(packet.get('dport', 0))
+    # ── Protocol-aware hints (Improvement 6) ──────────────────────────────────
+    hints = flow['proto_hints']
+    # DNS oversized payload → exfiltration hint
+    if dport_int == 53 and packet_size > 200:
+        hints['dns_oversize'] = True
+    # Known C2 port connection
+    if dport_int in _C2_PORTS:
+        hints['c2_port'] = True
+    # TLS/HTTPS: many short forward packets in short burst → DGA/C2 beacon
+    if dport_int in (443, 8443) and packet_size < 150 and is_fwd:
+        hints['tls_small_fwd'] = hints.get('tls_small_fwd', 0) + 1
+    # HTTP: very small fwd payload with high packet count → scanner / flood
+    if dport_int in (80, 8080) and packet_size < 100 and is_fwd:
+        hints['http_small_fwd'] = hints.get('http_small_fwd', 0) + 1
+    # ICMP
+    if proto_int == 1:
+        hints['icmp_count'] = hints.get('icmp_count', 0) + 1
 
-    if source_iface == 'wifi':
-        # Wi-Fi NIC sees internet↔client traffic through NAT.
-        # Only update known device records — discovery is ARP-based, not flow-based.
-        _hotspot_tracker.observe_wifi(src, dst, packet_size, dport)
-    else:
-        # Hotspot adapter or PCAP: full bidirectional bandwidth accounting.
+    # ── Suricata-style per-packet rule engine ─────────────────────────────────
+    # Runs on every packet immediately — does NOT wait for flow completion.
+    is_simulated = bool(packet.get('is_simulated', False))
+    _rule_engine(
+        src_ip     = src,
+        dst_ip     = dst,
+        sport      = int(packet.get('sport', 0)),
+        dport      = dport_int,
+        proto      = proto_int,
+        flags      = flags,
+        pkt_size   = packet_size,
+        is_simulated = is_simulated,
+    )
+
+    # ── Hotspot device bandwidth tracking ─────────────────────────────────────
+    source_iface = packet.get('source_iface', '')
+    if source_iface != 'wifi':
         if _is_hotspot_ip(src) or _is_hotspot_ip(dst):
-            _hotspot_tracker.observe(src, dst, packet_size, dport)
+            _hotspot_tracker.observe(src, dst, packet_size, dport_int)
+    # wifi packets: used for system-wide ML/alerts only — no per-device tracking.
 
     return True
 
@@ -1315,10 +2013,46 @@ def _predict_alerts(flow_items):
         iso_scores = np.zeros(len(flow_items))
 
     alerts = []
-    for idx, (fid, _) in enumerate(flow_items):
-        fused       = fusion_engine(str(rf_pred[idx]), float(rf_prob[idx]), float(iso_scores[idx]))
+    for idx, (fid, flow_data) in enumerate(flow_items):
+        # Protocol hints from packet-level accumulation (Improvement 6)
+        proto_hints = flow_data.get('proto_hints', {})
+        _hint_boost  = 0.0
+        if proto_hints.get('c2_port'):
+            _hint_boost += 0.15
+        if proto_hints.get('dns_oversize'):
+            _hint_boost += 0.10
+        if proto_hints.get('tls_small_fwd', 0) > 20:
+            _hint_boost += 0.08
+        if proto_hints.get('http_small_fwd', 0) > 50:
+            _hint_boost += 0.08
+
+        src_ip       = fid[0]
+        _host_rec    = _host_scores.get(src_ip, {})
+        _host_cur    = _host_rec.get('score', 0.0)
+        _abuse_score = abuse_ipdb.get_abuse_score(src_ip)
+
+        fused = fusion_engine(
+            str(rf_pred[idx]),
+            float(rf_prob[idx]),
+            float(iso_scores[idx]),
+            abuse_score  = _abuse_score,
+            rule_hit     = bool(_hint_boost > 0),
+            host_score   = _host_cur,
+        )
+        # Apply hint boost on top of fusion score
+        if _hint_boost > 0:
+            fused['final_score'] = round(
+                min(MAX_Y_ALERT_SCORE, fused['final_score'] + _hint_boost * 100), 2
+            )
         attack_type = fused['attack_type']
         src_ip      = fid[0]
+
+        # ── Skip whitelisted or dedup-suppressed flows ────────────────────────
+        if src_ip in WHITELIST_IPS or fid[1] in WHITELIST_IPS:
+            continue
+        if attack_type.lower() not in ('normal', 'benign'):
+            if _should_suppress(src_ip, attack_type):
+                continue
 
         # ── MITRE ATT&CK ─────────────────────────────────────────────────────
         mitre = ATTACK_TO_MITRE.get(attack_type, {})
@@ -1342,8 +2076,8 @@ def _predict_alerts(flow_items):
             except Exception:
                 pass
 
-        # ── AbuseIPDB reputation ──────────────────────────────────────────────
-        abuse_score = abuse_ipdb.get_abuse_score(src_ip)
+        # ── AbuseIPDB reputation (already computed above for fusion) ──────────
+        abuse_score = _abuse_score
 
         # ── Host threat score update ──────────────────────────────────────────
         if attack_type.lower() != 'normal':
@@ -1595,7 +2329,10 @@ def get_host_scores(request):
 
 # ── Feature 5: Incidents ────────────────────────────────────────────────────────
 def get_incidents(request):
-    return JsonResponse({'incidents': incident_engine.get_all_incidents()})
+    return JsonResponse({
+        'incidents': incident_engine.get_all_incidents(),
+        'summary':   incident_engine.get_summary(),
+    })
 
 
 # ── Feature 6: IP Blocking ─────────────────────────────────────────────────────
@@ -1644,6 +2381,14 @@ def simulate_attack(request):
     try:
         body        = json.loads(request.body or '{}')
         attack_type = body.get('attack_type', 'DoS')
+        if attack_type == '__list__':
+            # Return all supported types with descriptions
+            return JsonResponse({
+                'supported': [
+                    {'type': t, 'description': sim.get_description(t)}
+                    for t in sim.SUPPORTED
+                ]
+            })
         if attack_type not in sim.SUPPORTED:
             return JsonResponse({'error': f'Unknown type. Supported: {sim.SUPPORTED}'}, status=400)
 
@@ -1655,9 +2400,11 @@ def simulate_attack(request):
         resp = JsonResponse({
             'status':         'ok',
             'attack_type':    attack_type,
+            'description':    sim.get_description(attack_type),
             'packets_sent':   len(packets),
             'alerts_emitted': len(alerts),
             'model_labels':   list({a.get('final', {}).get('attack_type') for a in alerts}),
+            'rule_alerts':    sum(1 for a in alerts if a.get('rule_triggered')),
         })
         resp['Access-Control-Allow-Origin'] = '*'
         return resp
