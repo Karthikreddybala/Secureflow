@@ -1102,15 +1102,34 @@ class HotspotDeviceTracker:
     def _find_hotspot_iface_name(self) -> str | None:
         """Find the Windows Mobile Hotspot adapter name.
 
-        Strategy 1 — netsh (most reliable: works even when Scapy can't enumerate IPs):
-          Parse 'netsh interface ip show addresses' and return the interface
-          whose IP is in the 192.168.137.0/24 subnet.
+        Strategy 0 (PowerShell — most reliable on all Windows locales):
+          Get-NetIPAddress returns exact InterfaceAlias with no parsing ambiguity.
 
-        Strategy 2 — Scapy interface list: scan for whichever adapter has a
-          192.168.137.x address in its IP list.
+        Strategy 1 — netsh:
+          Parse 'netsh interface ip show addresses'. Reliable but locale-dependent.
+
+        Strategy 2 — Scapy interface list:
+          Scan for whichever adapter has 192.168.137.x in its IP list.
         """
         import re as _re
-        # ── Strategy 1: netsh ────────────────────────────────────────────────
+
+        # ── Strategy 0: PowerShell Get-NetIPAddress (fastest + locale-safe) ──────
+        try:
+            out = subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 'Get-NetIPAddress -AddressFamily IPv4 '
+                 '| Where-Object { $_.IPAddress -like "192.168.137.*" } '
+                 '| Select-Object -ExpandProperty InterfaceAlias '
+                 '| Select-Object -First 1'],
+                capture_output=True, text=True, timeout=8
+            ).stdout.strip()
+            if out:
+                logger.info('BW-capture: hotspot adapter found via PowerShell → "%s"', out)
+                return out
+        except Exception as exc:
+            logger.debug('BW-capture PowerShell probe failed: %s', exc)
+
+        # ── Strategy 1: netsh ────────────────────────────────────────────────────
         try:
             out = subprocess.run(
                 ['netsh', 'interface', 'ip', 'show', 'addresses'],
@@ -1128,7 +1147,7 @@ class HotspotDeviceTracker:
         except Exception as exc:
             logger.debug('BW-capture netsh probe failed: %s', exc)
 
-        # ── Strategy 2: Scapy interface list ────────────────────────────────
+        # ── Strategy 2: Scapy interface list ──────────────────────────────────────────
         try:
             from scapy.arch.windows import get_windows_if_list
             for iface in get_windows_if_list():
@@ -1140,54 +1159,108 @@ class HotspotDeviceTracker:
         except Exception as exc:
             logger.debug('BW-capture Scapy probe failed: %s', exc)
 
-        logger.warning('BW-capture: hotspot adapter not found — per-device bandwidth will stay 0')
+        logger.warning(
+            'BW-capture: hotspot adapter not found — ensure Mobile Hotspot is '
+            'enabled in Windows Settings. Per-device bandwidth will stay 0 until '
+            'hotspot is active.'
+        )
         return None
 
     def _bw_packet_cb(self, pkt):
-        """Scapy per-packet callback — called from the capture thread."""
+        """Scapy per-packet callback for the in-process BW capture thread.
+
+        Does two things:
+          1. Updates per-device bytes_up / bytes_down in HotspotDeviceTracker.
+          2. Feeds the packet into the ML/rule-engine pipeline (same as pp.py)
+             so attacks FROM hotspot devices are detected even without pp.py.
+        """
         try:
-            from scapy.all import IP as _IP
+            from scapy.all import IP as _IP, TCP as _TCP, UDP as _UDP
             if _IP not in pkt:
                 return
             src   = pkt[_IP].src
             dst   = pkt[_IP].dst
             size  = len(pkt)
-            dport = int(pkt.dport) if hasattr(pkt, 'dport') and pkt.dport else 0
+            proto = pkt[_IP].proto
+            dport = 0
+            sport = 0
+            flags = 0
+            ip_hdr = pkt[_IP].ihl * 4
+            tcp_hdr = 0
+
+            if _TCP in pkt:
+                sport   = int(pkt[_TCP].sport)
+                dport   = int(pkt[_TCP].dport)
+                flags   = int(pkt[_TCP].flags)
+                tcp_hdr = pkt[_TCP].dataofs * 4
+            elif _UDP in pkt:
+                sport = int(pkt[_UDP].sport)
+                dport = int(pkt[_UDP].dport)
+
+            # 1. Per-device bandwidth accounting
             if _is_hotspot_ip(src) or _is_hotspot_ip(dst):
                 self.observe(src, dst, size, dport)
+
+            # 2. Feed into ML + rule engine pipeline
+            #    This ensures hotspot device traffic triggers IDS rules and alerts
+            #    even when pp.py is not running or its WS connection drops.
+            packet_info = {
+                'timestamp':    time.time(),
+                'src':          src,
+                'dst':          dst,
+                'sport':        sport,
+                'dport':        dport,
+                'proto':        proto,
+                'size':         size,
+                'ip_hdr_len':   ip_hdr,
+                'tcp_hdr_len':  tcp_hdr,
+                'flags':        flags,
+                'source_iface': 'hotspot',   # always hotspot adapter
+            }
+            # Use non-blocking put so a slow queue never blocks capture
+            try:
+                _bw_packet_queue.put_nowait(packet_info)
+            except Exception:
+                pass  # queue full — drop silently
+
         except Exception:
             pass
 
     def _bw_capture_loop(self):
         """Dedicated bandwidth-capture loop — runs forever inside Django.
 
-        Finds the hotspot adapter, starts a Scapy sniff, and retries on error.
-        By running inside the same process as HotspotDeviceTracker we bypass
-        the pp.py → WebSocket → Django pipeline entirely, guaranteeing that
-        bytes_up / bytes_down update for every connected device.
+        Finds the hotspot adapter by name (PowerShell/netsh/Scapy), starts a
+        Scapy sniff, and retries on error.  If the hotspot adapter disappears
+        (user toggled hotspot off), it re-probes every 30s until it comes back.
+
+        Guarantees that bytes_up / bytes_down update for every connected device
+        INDEPENDENT of whether pp.py / WebSocket is running.
         """
         # Brief startup delay so Django finishes loading before we try Scapy
         time.sleep(5)
 
-        iface = self._find_hotspot_iface_name()
-        if not iface:
-            return   # No hotspot adapter → nothing to do
-
         from scapy.all import sniff as _sniff
-        logger.info('BW-capture: starting direct hotspot capture on "%s"', iface)
 
         while True:
+            iface = self._find_hotspot_iface_name()
+            if not iface:
+                # Hotspot not active yet — wait and retry
+                logger.info('BW-capture: hotspot not found, retrying in 30s …')
+                time.sleep(30)
+                continue
+
+            logger.info('BW-capture: starting on "%s"', iface)
             try:
                 _sniff(
                     iface=iface,
                     store=False,
                     prn=self._bw_packet_cb,
-                    # Never stop voluntarily — loop runs until Django exits
                     stop_filter=lambda _: False,
                 )
             except Exception as exc:
-                logger.warning('BW-capture: sniffer crashed (%s) — retrying in 15 s', exc)
-                time.sleep(15)
+                logger.warning('BW-capture crashed (%s) — re-detecting interface in 10s', exc)
+                time.sleep(10)
+                # Loop back → re-detect interface (hotspot adapter name can change)
 
     def observe(self, src: str, dst: str, pkt_size: int, dport: int):
         """Called for every packet from the hotspot adapter.
@@ -1479,6 +1552,28 @@ _hotspot_tracker = HotspotDeviceTracker()
 # ── In-memory flow table ───────────────────────────────────────────────────────
 flows      = {}
 flows_lock = threading.Lock()
+
+# ── BW-capture → ML pipeline queue ────────────────────────────────────────────
+# The in-process hotspot Scapy sniffer feeds packets here.
+# A background thread drains the queue and calls process_packet() so:
+#   • All 12 Suricata-style rules fire on real hotspot traffic in real-time
+#   • ML flow features accumulate from real packets (not just simulated ones)
+#   • Bandwidth + ML detection both run from the SAME packet stream
+import queue as _queue
+_bw_packet_queue: _queue.Queue = _queue.Queue(maxsize=10_000)
+
+def _bw_queue_consumer():
+    """Drain hotspot packets into the ML/rule engine pipeline."""
+    while True:
+        try:
+            pkt_info = _bw_packet_queue.get(timeout=1.0)
+            process_packet(pkt_info)   # ingest into flow table + rule engine
+        except _queue.Empty:
+            continue
+        except Exception as exc:
+            logger.debug('BW queue consumer error: %s', exc)
+
+threading.Thread(target=_bw_queue_consumer, daemon=True, name='bw-queue-consumer').start()
 
 processing_stats = {
     'flows_processed':        0,
