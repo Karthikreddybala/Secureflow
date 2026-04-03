@@ -125,3 +125,55 @@ class BlockedIP(models.Model):
             'unblocked_at': self.unblocked_at,
             'unblocked_by': self.unblocked_by,
         }
+
+
+class DeviceAlertEmail(models.Model):
+    """Maps a hotspot client IP to one or more alert email recipients."""
+    ip           = models.CharField(max_length=45, blank=True)   # 192.168.137.x
+    mac          = models.CharField(max_length=17, blank=True)   # AA-BB-CC-DD-EE-FF
+    label        = models.CharField(max_length=128, blank=True)  # friendly name
+    email        = models.EmailField()
+    min_severity = models.CharField(max_length=10, default='Medium')  # Low/Medium/High
+    enabled      = models.BooleanField(default=True)
+    created_at   = models.FloatField(default=time.time)
+
+    class Meta:
+        ordering = ['ip', 'email']
+        indexes  = [
+            models.Index(fields=['ip']),
+            models.Index(fields=['mac']),
+            models.Index(fields=['enabled']),
+        ]
+
+    def to_dict(self):
+        return {
+            'id':           self.pk,
+            'ip':           self.ip,
+            'mac':          self.mac,
+            'label':        self.label,
+            'email':        self.email,
+            'min_severity': self.min_severity,
+            'enabled':      self.enabled,
+            'created_at':   self.created_at,
+        }
+
+
+class PushSubscription(models.Model):
+    """Browser Web Push subscription endpoint — one per browser session."""
+    endpoint     = models.TextField(unique=True)
+    p256dh       = models.TextField()   # client public key
+    auth         = models.TextField()   # auth secret
+    user_agent   = models.CharField(max_length=255, blank=True)
+    created_at   = models.FloatField(default=time.time)
+    last_used_at = models.FloatField(default=time.time)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def to_dict(self):
+        return {
+            'id':       self.pk,
+            'endpoint': self.endpoint,
+            'p256dh':   self.p256dh,
+            'auth':     self.auth,
+        }

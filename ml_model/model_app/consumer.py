@@ -121,3 +121,64 @@ class PacketConsumer(AsyncWebsocketConsumer):
             logger.error("JSON decode error: %s", error)
         except Exception:
             logger.exception("Error processing packet data")
+
+
+class DeviceConsumer(AsyncWebsocketConsumer):
+    """
+    WebSocket consumer for real-time hotspot device updates.
+    ws://localhost:8000/ws/devices/
+
+    On connect: immediately sends current device list.
+    Every 2 seconds: pushes fresh device snapshot to all subscribers.
+    Also receives group messages from _push_device_update().
+    """
+    _push_task = None
+
+    async def connect(self):
+        self.group_name = 'hotspot_devices'
+        await self.channel_layer.group_add(self.group_name, self.channel_name)
+        await self.accept()
+        logger.info('DeviceConsumer connected')
+
+        # Send initial snapshot immediately
+        await self._send_snapshot()
+
+        # Start periodic push task (one per instance)
+        self._push_task = asyncio.create_task(self._periodic_push())
+
+    async def disconnect(self, close_code):
+        if self._push_task:
+            self._push_task.cancel()
+            try:
+                await self._push_task
+            except asyncio.CancelledError:
+                pass
+        await self.channel_layer.group_discard(self.group_name, self.channel_name)
+        logger.info('DeviceConsumer disconnected')
+
+    async def _send_snapshot(self):
+        """Fetch device list and push to this client."""
+        try:
+            from .views import _hotspot_tracker
+            devices = await sync_to_async(_hotspot_tracker.get_all, thread_sensitive=False)()
+            stats   = await sync_to_async(_hotspot_tracker.get_stats, thread_sensitive=False)()
+            await self.send(text_data=json.dumps({'devices': devices, 'stats': stats}))
+        except Exception as exc:
+            logger.error('DeviceConsumer snapshot error: %s', exc)
+
+    async def _periodic_push(self):
+        """Push device updates to THIS client every 2 seconds."""
+        while True:
+            await asyncio.sleep(2)
+            try:
+                await self._send_snapshot()
+            except Exception:
+                break   # Client disconnected
+
+    async def send_devices(self, event):
+        """Handle group broadcast from _push_device_update()."""
+        try:
+            await self.send(text_data=json.dumps(event['data']))
+        except Exception:
+            pass
+

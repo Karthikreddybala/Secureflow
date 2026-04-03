@@ -10,6 +10,16 @@ Copy ml_model/.env.example to ml_model/.env and fill in your values.
 import os
 from pathlib import Path
 
+# ── Load .env file ────────────────────────────────────────────────────────────
+# This must happen BEFORE any os.getenv() calls (including those in views.py
+# which are executed at import time when Django starts).
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent / '.env'
+    load_dotenv(_env_path, override=False)
+except ImportError:
+    pass  # python-dotenv not installed — rely on OS environment variables
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 

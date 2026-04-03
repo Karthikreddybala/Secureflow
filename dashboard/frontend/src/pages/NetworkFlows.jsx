@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
+import './css/NetworkFlows.css';
 
 const ML_API = 'http://127.0.0.1:8000/model_app';
 

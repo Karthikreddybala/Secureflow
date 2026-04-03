@@ -16,13 +16,22 @@ import NetworkFlows from './pages/NetworkFlows.jsx';
 import Login from './pages/login.jsx';
 import Register from './pages/register.jsx';
 import AdminUsers from './pages/AdminUsers.jsx';
+import HotspotDevices from './pages/HotspotDevices.jsx';
+import DeviceEmails from './pages/DeviceEmails.jsx';
 import { store } from './store/index.js';
 import globalSocketManager from './server/globalSocketManager.js';
+import { setupPushNotifications } from './server/pushNotifications.js';
 
 /** Inner wrapper that initializes websocket after auth check */
 function AppInner() {
   useEffect(() => {
     globalSocketManager.init(store.dispatch);
+    // Register service worker + subscribe to Web Push (silently — user sees no prompt
+    // unless VAPID keys are configured in the backend .env)
+    setupPushNotifications().then(res => {
+      if (res.subscribed) console.info('[SecureFlow] Web push subscribed ✓');
+      else if (res.reason) console.info('[SecureFlow] Push not active:', res.reason);
+    });
     return () => globalSocketManager.disconnect();
   }, []);
 
@@ -57,7 +66,9 @@ function LayoutWithSidebar() {
           <Route path="/analytics"     element={<AttackAnalytics />} />
           <Route path="/alerts"        element={<AlertsPage />} />
           <Route path="/flows"         element={<NetworkFlows />} />
-          <Route path="/admin/users"   element={<ProtectedRoute adminOnly><AdminUsers /></ProtectedRoute>} />
+          <Route path="/hotspot"            element={<HotspotDevices />} />
+          <Route path="/admin/users"        element={<ProtectedRoute adminOnly><AdminUsers /></ProtectedRoute>} />
+          <Route path="/device-emails"      element={<ProtectedRoute adminOnly><DeviceEmails /></ProtectedRoute>} />
         </Routes>
       </main>
     </div>

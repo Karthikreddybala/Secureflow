@@ -1,5 +1,14 @@
-.traffic-page {
+/* ══════════════════════════════════════════════════════════
+   RealTimeTraffic – page & layout
+   ══════════════════════════════════════════════════════════ */
+
+/* When cyber-page AND traffic-page are both applied:
+   lock to viewport so the 2-column grid fills the screen */
+.cyber-page.traffic-page {
+  height: 100vh;
   overflow: hidden;
+  padding: 14px;
+  box-sizing: border-box;
 }
 
 .traffic-layout {
@@ -10,6 +19,7 @@
   min-height: 0;
 }
 
+/* ── Main panel (left column) ─────────────────────────── */
 .traffic-main {
   padding: 16px;
   display: flex;
@@ -45,6 +55,7 @@
   flex-wrap: wrap;
 }
 
+/* ── Control Buttons ──────────────────────────────────── */
 .traffic-btn {
   border: 1px solid transparent;
   border-radius: 999px;
@@ -53,6 +64,8 @@
   font-weight: 700;
   cursor: pointer;
   color: #e9f7ff;
+  font-family: var(--font-sans);
+  transition: opacity 0.15s, filter 0.15s;
 }
 
 .traffic-btn.warning {
@@ -72,16 +85,14 @@
   cursor: not-allowed;
 }
 
+/* ── KPI strip ────────────────────────────────────────── */
 .traffic-kpis {
   margin-bottom: 10px;
 }
 
-.cyber-kpi-value.small {
-  font-size: 0.9rem;
-}
-
+/* ── Live Table Wrapper ───────────────────────────────── */
 .live-table-wrap {
-  border: 1px solid var(--panel-soft-border);
+  border: 1px solid var(--border);
   border-radius: 14px;
   background: rgba(8, 19, 34, 0.9);
   padding: 10px;
@@ -159,56 +170,75 @@
   border: 1px solid rgba(97, 139, 184, 0.5);
 }
 
+/* ── Scrollable table area ────────────────────────────── */
 .live-table-scroll {
   overflow: auto;
-  border: 1px solid rgba(87, 130, 176, 0.28);
+  border: 1px solid var(--border);
   border-radius: 10px;
   min-height: 0;
   flex: 1;
   max-height: calc(100vh - 340px);
+  background: rgba(3, 6, 15, 0.7);
 }
 
+/* Table — matches global cyber neon palette */
 .live-traffic-table {
   margin-bottom: 0;
-  color: #d8ebff;
+  color: var(--text-primary);
   font-size: 0.82rem;
   min-width: 960px;
+  border-collapse: collapse;
+  width: 100%;
 }
 
+/* Sticky header with cyan-tinted glass */
 .live-traffic-table thead th {
   position: sticky;
   top: 0;
   z-index: 2;
-  background: rgba(16, 34, 56, 0.96);
-  border-bottom: 1px solid rgba(96, 137, 181, 0.45);
-  color: #ebf6ff;
+  background: linear-gradient(180deg, rgba(0, 245, 212, 0.1) 0%, rgba(8, 14, 30, 0.97) 100%);
+  border-bottom: 1px solid var(--border-bright);
+  color: var(--accent);
   text-transform: uppercase;
-  letter-spacing: 0.04em;
-  font-size: 0.73rem;
+  letter-spacing: 0.07em;
+  font-size: 0.7rem;
+  font-weight: 700;
   white-space: nowrap;
+  padding: 10px 12px;
 }
 
+/* Body rows */
 .live-traffic-table tbody td {
-  border-color: rgba(80, 120, 160, 0.24);
+  border-bottom: 1px solid rgba(0, 245, 212, 0.06);
   vertical-align: middle;
+  padding: 8px 12px;
+  transition: background 0.1s;
 }
 
 .live-traffic-table tbody tr {
-  background: rgba(8, 20, 34, 0.72);
+  background: rgba(4, 9, 22, 0.6);
 }
 
 .live-traffic-table tbody tr:nth-child(2n) {
-  background: rgba(10, 24, 42, 0.9);
+  background: rgba(0, 245, 212, 0.025);
 }
 
+.live-traffic-table tbody tr:hover td {
+  background: rgba(0, 245, 212, 0.05);
+}
+
+/* Code / IP address cells */
 .live-traffic-table code {
-  color: #c4e2fd;
-  background: rgba(52, 92, 130, 0.28);
-  border: 1px solid rgba(81, 124, 168, 0.45);
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
 }
 
+/* ── Protocol Pills ───────────────────────────────────── */
 .protocol-pill {
   border-radius: 999px;
   padding: 2px 8px;
@@ -256,9 +286,12 @@
   color: var(--text-muted);
 }
 
+/* ── Right sidebar (4 stacked panels) ────────────────── */
+/* Protocol Breakdown (row 1) + Top Source Hosts (row 2) are taller.    */
+/* Traffic Intensity (row 3) is compact; Attack Sim (row 4) is medium.  */
 .traffic-side {
   display: grid;
-  grid-template-rows: repeat(4, minmax(0, 1fr));
+  grid-template-rows: minmax(0, 1.8fr) minmax(0, 1.8fr) minmax(0, 0.8fr) minmax(0, 1.1fr);
   gap: 12px;
   min-height: 0;
 }
@@ -270,28 +303,55 @@
   min-height: 0;
 }
 
+/* Source/protocol list rows */
 .traffic-stat-item,
 .traffic-source-item {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 8px;
-}
-
-.traffic-source-item code {
-  color: #cbe4fb;
-  background: rgba(48, 86, 123, 0.28);
+  padding: 6px 8px;
   border-radius: 6px;
-  border: 1px solid rgba(90, 132, 176, 0.45);
-  padding: 2px 5px;
+  border: 1px solid transparent;
+  transition: border-color 0.15s, background 0.15s;
+}
+.traffic-stat-item:hover,
+.traffic-source-item:hover {
+  border-color: var(--border);
+  background: rgba(0, 245, 212, 0.04);
 }
 
-.traffic-source-item span,
+/* IP address code badge in source list */
+.traffic-source-item code {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+/* Protocol breakdown value */
 .traffic-stat-item strong {
-  color: #eaf6ff;
-  font-size: 0.8rem;
+  color: var(--accent);
+  font-size: 0.85rem;
+  font-weight: 700;
 }
 
+/* Packet count in source list */
+.traffic-source-item span:last-child {
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+/* Protocol label */
+.traffic-stat-item > span:first-child {
+  color: var(--text-primary);
+  font-size: 0.82rem;
+}
+
+/* ── Traffic intensity bar ────────────────────────────── */
 .traffic-intensity-track {
   margin-top: 6px;
   width: 100%;
@@ -305,6 +365,7 @@
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, #24dbe2 0%, #47e592 55%, #ffbf47 100%);
+  transition: width 0.4s ease;
 }
 
 .traffic-intensity-note {
@@ -314,8 +375,10 @@
   line-height: 1.4;
 }
 
+/* ── Responsive ───────────────────────────────────────── */
 @media (max-width: 1260px) {
-  .traffic-page {
+  .cyber-page.traffic-page {
+    height: auto;
     overflow: auto;
   }
 

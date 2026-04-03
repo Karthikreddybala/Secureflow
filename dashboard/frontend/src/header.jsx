@@ -11,12 +11,14 @@ const NAV_ITEMS = [
   { path: '/traffic',     icon: '⟳',  label: 'Live Traffic' },
   { path: '/alerts',      icon: '🔔', label: 'Alerts' },
   { path: '/flows',       icon: '📊', label: 'Network Flows' },
+  { path: '/hotspot',     icon: '📡', label: 'Devices' },
   { path: '/blocked-ips', icon: '🛡', label: 'Blocked IPs' },
   { path: '/analytics',   icon: '📈', label: 'Analytics' },
 ];
 
 const ADMIN_NAV = [
-  { path: '/admin/users', icon: '👥', label: 'Users' },
+  { path: '/admin/users',   icon: '👥', label: 'Users' },
+  { path: '/device-emails', icon: '📧', label: 'Alert Emails' },
 ];
 
 function Header() {

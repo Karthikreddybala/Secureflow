@@ -150,3 +150,26 @@
   transition: transform 0.15s;
 }
 .inc-embed-card:hover { transform: translateY(-1px); }
+
+/* ── Export buttons (self-contained so no dashboard.css dependency) ── */
+.export-btn {
+  background: rgba(0, 245, 212, 0.12);
+  border: 1px solid rgba(0, 245, 212, 0.5);
+  color: var(--accent, #00f5d4);
+  padding: 5px 14px;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.2s, filter 0.2s;
+  font-family: var(--font-sans, 'Inter', sans-serif);
+}
+.export-btn:hover:not(:disabled) { background: rgba(0, 245, 212, 0.25); }
+.export-btn.pdf {
+  background: rgba(255, 69, 96, 0.12);
+  border-color: rgba(255, 69, 96, 0.5);
+  color: var(--danger, #ff4560);
+}
+.export-btn.pdf:hover:not(:disabled) { background: rgba(255, 69, 96, 0.25); }
+.export-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+

@@ -39,7 +39,16 @@ echo  Auth API:   http://localhost:5000
 echo  WebSockets: ws://localhost:8000/ws/alerts/   (alerts feed)
 echo              ws://localhost:8000/ws/network/  (packet feed)
 echo.
-echo  Default admin:  set role in DB or via /admin/users API
+echo  ── Packet Capture (run manually as Administrator) ────────────
+echo  cd ml_model\engine
+echo  C:\Users\saket\3-2Mini\mini\Scripts\python.exe pp.py
+echo.
+echo  Dual-capture mode (auto-detects):
+echo    [WIFI]    Wi-Fi          (your laptop traffic)
+echo    [HOTSPOT] Wi-Fi 2        (hotspot client traffic)
+echo.
+echo  Enable Mobile Hotspot first:
+echo    Settings -^> Network ^& Internet -^> Mobile Hotspot
 echo  ─────────────────────────────────────────────────────────────
 echo.
 pause
