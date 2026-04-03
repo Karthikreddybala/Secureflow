@@ -9,12 +9,26 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || 'secureflow-super-secret-key-change-in-prod';
 const SALT_ROUNDS = 10;
 
+// JWT secret — MUST be set via environment variable in production
+if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
+  console.error('FATAL: JWT_SECRET environment variable is not set. Refusing to start in production.');
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-insecure-secret-do-not-use-in-prod';
+
 // ===== MIDDLEWARE =====
+// In production, set FRONTEND_URL env var to restrict CORS to your frontend domain.
+// e.g. FRONTEND_URL=https://yourdomain.com
+const FRONTEND_URL = process.env.FRONTEND_URL || null;
 app.use(cors({
-  origin: true,
+  origin: FRONTEND_URL
+    ? (origin, callback) => {
+        if (!origin || origin === FRONTEND_URL) return callback(null, true);
+        return callback(new Error('Not allowed by CORS'));
+      }
+    : true,   // allow all in dev (no FRONTEND_URL set)
   credentials: true,
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));

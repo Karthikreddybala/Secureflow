@@ -15,4 +15,5 @@ joblib>=1.1.0
 xgboost>=2.0.0
 
 # Optional: For production deployment
-redis>=4.0.0  # For Redis channel layer
+redis>=4.0.0          # Redis client
+channels_redis>=4.0.0 # Redis-backed channel layer for multi-worker deployments

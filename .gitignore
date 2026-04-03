@@ -1,6 +1,4 @@
 
-# React .gitignore Template - Updated 2025
-
 # Local git metadata backups
 .git_old_*/
 
@@ -26,9 +24,10 @@ out/
 .vercel/
 .netlify/
 
-# React specific
+# Environment files (never commit real secrets)
 .env
 .env.local
+.env.production
 .env.development.local
 .env.test.local
 .env.production.local
@@ -100,18 +99,6 @@ temp/
 # Optional stylelint cache
 .stylelintcache
 
-# Microbundle cache
-.rpt2_cache/
-.rts2_cache_cjs/
-.rts2_cache_es/
-.rts2_cache_umd/
-
-# Optional REPL history
-.node_repl_history
-
-# Output of 'npm pack'
-*.tgz
-
 # Yarn v2
 .yarn/cache
 .yarn/unplugged
@@ -130,26 +117,7 @@ firestore-debug.log
 # DynamoDB Local files
 .dynamodb/
 
-# TernJS port file
-.tern-port
-
-# Stores VSCode versions used for testing VSCode extensions
-.vscode-test
-
-# yarn v0 lock file
-yarn.lock
-
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-
-# Django #
+# DjAngo
 *.log
 *.pot
 *.pyc
@@ -157,140 +125,62 @@ __pycache__
 db.sqlite3
 media
 
-# Backup files # 
-*.bak 
+# Backup files
+*.bak
 
-# If you are using PyCharm # 
-# User-specific stuff
-.idea/**/workspace.xml
-.idea/**/tasks.xml
-.idea/**/usage.statistics.xml
-.idea/**/dictionaries
-.idea/**/shelf
+# Python
+*.py[cod]
+*$py.class
 
-# AWS User-specific
-.idea/**/aws.xml
-
-# Generated files
-.idea/**/contentModel.xml
-
-# Sensitive or high-churn files
-.idea/**/dataSources/
-.idea/**/dataSources.ids
-.idea/**/dataSources.local.xml
-.idea/**/sqlDataSources.xml
-.idea/**/dynamic.xml
-.idea/**/uiDesigner.xml
-.idea/**/dbnavigator.xml
-
-# Gradle
-.idea/**/gradle.xml
-.idea/**/libraries
-
-# File-based project format
-*.iws
-
-# IntelliJ
-out/
-
-# JIRA plugin
-atlassian-ide-plugin.xml
-
-# Python # 
-*.py[cod] 
-*$py.class 
-
-# Distribution / packaging 
-.Python build/ 
-develop-eggs/ 
-dist/ 
-downloads/ 
-eggs/ 
-.eggs/ 
-lib/ 
-lib64/ 
-parts/ 
-sdist/ 
-var/ 
-wheels/ 
+# Packaging
+.Python
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
 *.whl
-*.egg-info/ 
-.installed.cfg 
-*.egg 
-*.manifest 
-*.spec 
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Installer logs 
-pip-log.txt 
-pip-delete-this-directory.txt 
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
 
-# Unit test / coverage reports 
-htmlcov/ 
-.tox/ 
-.coverage 
-.coverage.* 
-.cache 
-.pytest_cache/ 
-nosetests.xml 
-coverage.xml 
-*.cover 
-.hypothesis/ 
+# Jupyter Notebook
+.ipynb_checkpoints
 
-# Jupyter Notebook 
-.ipynb_checkpoints 
+# pyenv
+.python-version
 
-# pyenv 
-.python-version 
+# celery
+celerybeat-schedule.*
 
-# celery 
-celerybeat-schedule.* 
+# Environments
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# SageMath parsed files 
-*.sage.py 
+# mypy
+.mypy_cache/
 
-# Environments 
-.env 
-.venv 
-env/ 
-venv/ 
-ENV/ 
-env.bak/ 
-venv.bak/ 
-
-# mkdocs documentation 
-/site 
-
-# mypy 
-.mypy_cache/ 
-
-# Sublime Text # 
-*.tmlanguage.cache 
-*.tmPreferences.cache 
-*.stTheme.cache 
-*.sublime-workspace 
-*.sublime-project 
-
-# sftp configuration file 
-sftp-config.json 
-
-# Package control specific files Package 
-Control.last-run 
-Control.ca-list 
-Control.ca-bundle 
-Control.system-ca-bundle 
-GitHub.sublime-settings 
-
-# Visual Studio Code # 
-.vscode/* 
-!.vscode/settings.json 
-!.vscode/tasks.json 
-!.vscode/launch.json 
-!.vscode/extensions.json 
-.history
-
-
-
-
+# ML model files (large binaries — download separately via download_models.py)
 *.pkl
 *.plk
 *.joblib
