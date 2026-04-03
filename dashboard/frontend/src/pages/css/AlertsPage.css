@@ -1,0 +1,84 @@
+/* ══════════════════════════════════════════════════════════
+   AlertsPage – page-specific overrides
+   All core styling comes from global index.css (sf-* classes)
+   ══════════════════════════════════════════════════════════ */
+
+/* Tab bar override — don't stretch tabs, keep labels readable */
+.sf-page .sf-tabs {
+  display: inline-flex;
+  flex: unset;
+  width: auto;
+  gap: 4px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 10px;
+  padding: 4px;
+  margin-bottom: 0;
+}
+
+.sf-page .sf-tab {
+  flex: unset;
+  padding: 8px 16px;
+  white-space: nowrap;
+}
+
+/* Toolbar row: tabs left, sort buttons right, wrap gracefully */
+.alerts-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+/* Sort buttons strip */
+.alerts-sort-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* Animated left-border accent on alert cards */
+.alert-feed-item {
+  animation: slideInAlert 0.25s ease both;
+}
+
+@keyframes slideInAlert {
+  from { opacity: 0; transform: translateX(-8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* Extra hover glow per severity */
+.alert-feed-item.high:hover   { background: rgba(255, 69, 96, 0.06); border-color: rgba(255,69,96,0.35); }
+.alert-feed-item.medium:hover { background: rgba(255, 184, 0, 0.05); border-color: rgba(255,184,0,0.3); }
+.alert-feed-item.low:hover    { background: rgba(41, 121, 255, 0.05); }
+
+/* SHAP feature chips inline */
+.shap-chip-positive {
+  font-size: 0.68rem;
+  background: rgba(255, 69, 96, 0.15);
+  color: var(--danger);
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+.shap-chip-negative {
+  font-size: 0.68rem;
+  background: rgba(41, 121, 255, 0.15);
+  color: var(--info);
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+
+/* Pending action banner */
+.pending-banner {
+  background: rgba(255, 184, 0, 0.08);
+  border: 1px solid rgba(255, 184, 0, 0.25);
+  border-radius: 10px;
+  padding: 12px 16px;
+  margin-bottom: 18px;
+  margin-top: 14px;
+  font-size: 0.85rem;
+  color: var(--warning);
+}
+

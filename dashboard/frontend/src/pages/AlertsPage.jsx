@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
 import { useAuth } from '../context/AuthContext';
 import { clearAlerts, setAlertLimit, setAlertSort, selectFilteredAlerts } from '../store/slices/alertsSlice';
+import './css/AlertsPage.css';
 
 const ML_API = 'http://127.0.0.1:8000/model_app';
 const AUTH_API = 'http://127.0.0.1:5000';
@@ -113,26 +114,26 @@ export default function AlertsPage() {
       </div>
 
       {/* Tabs + Sort toolbar */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 4 }}>
-        <div className="sf-tabs" style={{ marginBottom: 0 }}>
+      <div className="alerts-toolbar">
+        <div className="sf-tabs">
           {tabs.map(t => (
             <button key={t.id} className={`sf-tab ${t.cls} ${activeTab === t.id ? 'active' : ''}`} onClick={() => setActiveTab(t.id)}>
               {t.label} <span className="tab-count">{t.count}</span>
             </button>
           ))}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div className="alerts-sort-strip">
           <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Sort:</span>
           {['newest', 'oldest', 'severity', 'score'].map(s => (
             <button
               key={s}
               onClick={() => dispatch(setAlertSort(s))}
               style={{
-                fontSize: '0.72rem', padding: '3px 9px', borderRadius: 6, border: 'none',
+                fontSize: '0.72rem', padding: '4px 10px', borderRadius: 6, border: 'none',
                 cursor: 'pointer', fontWeight: alertSort === s ? 700 : 400,
-                background: alertSort === s ? 'var(--accent)' : 'var(--card)',
-                color: alertSort === s ? '#fff' : 'var(--text-muted)',
-                transition: 'all 0.15s',
+                background: alertSort === s ? 'var(--accent)' : 'var(--bg-card)',
+                color: alertSort === s ? '#000' : 'var(--text-muted)',
+                transition: 'all 0.15s', whiteSpace: 'nowrap',
               }}
             >
               {s.charAt(0).toUpperCase() + s.slice(1)}

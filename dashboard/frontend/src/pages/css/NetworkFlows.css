@@ -1,0 +1,41 @@
+/* ══════════════════════════════════════════════════════════
+   NetworkFlows – page-specific overrides
+   All core styling comes from global index.css (sf-* classes)
+   ══════════════════════════════════════════════════════════ */
+
+/* Highlighted row for simulated flows */
+.sf-table tbody tr.simulated-row {
+  background: rgba(123, 47, 255, 0.04);
+}
+.sf-table tbody tr.simulated-row:hover {
+  background: rgba(123, 47, 255, 0.08);
+}
+
+/* Filter bar card compact padding */
+.flows-filter-bar {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 16px 20px;
+  margin-bottom: 20px;
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+
+/* Compact monospace cells */
+.flows-cell-mono {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--accent);
+}
+
+/* Animated table row entrance */
+.sf-table tbody tr {
+  animation: rowFadeIn 0.2s ease both;
+}
+@keyframes rowFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}

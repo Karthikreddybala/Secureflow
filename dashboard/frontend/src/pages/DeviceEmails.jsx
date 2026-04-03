@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
+import './css/DeviceEmails.css';
 
 const ML_API = 'http://127.0.0.1:8000/model_app';
 
@@ -182,7 +183,7 @@ export default function DeviceEmails() {
       {/* Add / Edit form */}
       {showForm && (
         <form onSubmit={handleSave} style={{
-          background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12,
+          background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 12,
           padding: 24, marginBottom: 24,
         }}>
           <h3 style={{ margin: '0 0 18px', fontSize: '1rem', fontWeight: 700, color: 'var(--text-primary)' }}>
@@ -392,7 +393,7 @@ const labelStyle = {
 };
 const inputStyle = {
   width: '100%', boxSizing: 'border-box',
-  background: 'var(--bg)', border: '1px solid var(--border)',
+  background: 'var(--bg-surface)', border: '1px solid var(--border)',
   borderRadius: 8, padding: '9px 12px',
   color: 'var(--text-primary)', fontSize: '0.88rem',
   outline: 'none',
