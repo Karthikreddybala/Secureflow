@@ -1,10 +1,13 @@
-import React from 'react'
+import React, { useState } from 'react'
 import { useSelector } from 'react-redux'
 import './css/dashboard.css'
 import NetworkTrafficChart from '../charts/NetworkTrafficChart.jsx'
 import ProtocolPieChart from '../charts/ProtocolPieChart.jsx'
 import AttackDistributionChart from '../charts/AttackDistributionChart.jsx'
+import ThreatLeaderboard from '../components/ThreatLeaderboard.jsx'
 import { selectAlertStats } from '../store/slices/alertsSlice'
+
+const API = 'http://127.0.0.1:8000/model_app'
 
 const isNormalAlert = (alert) => String(alert?.final?.attack_type || '').toLowerCase() === 'normal'
 
@@ -24,6 +27,20 @@ function Dashboard() {
   const alertStats = useSelector((state) => selectAlertStats(state))
 
   const recentAlerts = allAlerts.slice(0, 32)
+  const [blockMsg, setBlockMsg] = useState({})
+
+  const blockIP = async (ip) => {
+    try {
+      await fetch(`${API}/block_ip`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip }),
+      })
+      setBlockMsg(prev => ({ ...prev, [ip]: '✅ Blocked' }))
+    } catch {
+      setBlockMsg(prev => ({ ...prev, [ip]: '❌ Failed' }))
+    }
+    setTimeout(() => setBlockMsg(prev => { const n = {...prev}; delete n[ip]; return n }), 2500)
+  }
 
   const threatLevel =
     alertStats.high > 0 ? 'Critical' : alertStats.medium > 0 ? 'Elevated' : alertStats.attacks > 0 ? 'Guarded' : 'Stable'
@@ -145,12 +162,41 @@ function Dashboard() {
                     </div>
 
                     <p className="alert-meta">
-                      {alert.protocol || 'N/A'} | {alert.src_ip || 'N/A'}:{alert.sport || '-'} -&gt; {alert.dst_ip || 'N/A'}:{alert.dport || '-'}
+                      {alert.protocol || 'N/A'} | {alert.src_ip || 'N/A'}:{alert.sport || '-'} → {alert.dst_ip || 'N/A'}:{alert.dport || '-'}
                     </p>
+
+                    {/* MITRE ATT&CK badge */}
+                    {alert.mitre?.id && (
+                      <div className="alert-mitre">
+                        <span className="mitre-id-badge">{alert.mitre.id}</span>
+                        <span className="mitre-tactic-badge">{alert.mitre.tactic}</span>
+                      </div>
+                    )}
+
+                    {/* SHAP top-3 drivers */}
+                    {alert.shap?.length > 0 && (
+                      <div className="alert-shap">
+                        {alert.shap.map((s, i) => (
+                          <span key={i} className={`shap-chip ${s.impact > 0 ? 'pos' : 'neg'}`}>
+                            {s.feature}: {s.impact > 0 ? '+' : ''}{s.impact}
+                          </span>
+                        ))}
+                      </div>
+                    )}
 
                     <div className="alert-footer">
                       <span className="score-pill">Score: {alert.final?.final_score || 'N/A'}</span>
-                      <small>{alert.timestamp ? new Date(alert.timestamp).toLocaleString() : 'No timestamp'}</small>
+                      {alert.abuse_score > 0 && (
+                        <span className="abuse-chip" style={{ color: alert.abuse_score > 50 ? '#ff4444' : '#ff9800' }}>
+                          ⚠ Abuse: {alert.abuse_score}%
+                        </span>
+                      )}
+                      {!isNormalAlert(alert) && alert.src_ip && (
+                        <button className="block-btn-sm" onClick={() => blockIP(alert.src_ip)}>
+                          {blockMsg[alert.src_ip] || '🚫 Block'}
+                        </button>
+                      )}
+                      <small>{alert.timestamp ? new Date(alert.timestamp * 1000).toLocaleString() : 'No timestamp'}</small>
                     </div>
                   </div>
                 ))}
@@ -165,6 +211,8 @@ function Dashboard() {
           <div className="dashboard-row dashboard-row-5 chart-slot">
             <AttackDistributionChart />
           </div>
+
+          <ThreatLeaderboard />
         </div>
       </div>
     </div>

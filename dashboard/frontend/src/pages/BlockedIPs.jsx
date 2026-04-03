@@ -1,213 +1,196 @@
-import React, { useMemo } from 'react';
-import { useSelector } from 'react-redux';
-import './css/blockedip.css';
-import { selectFilteredAlerts, selectAlertStats } from '../store/slices/alertsSlice';
+import React, { useState, useEffect, useCallback } from 'react';
+import { useAuth } from '../context/AuthContext';
 
-function calculateSeverityWeight(severity) {
-  const key = (severity || '').toLowerCase();
-  if (key === 'high') return 3;
-  if (key === 'medium') return 2;
-  if (key === 'low') return 1;
-  return 1;
-}
+const ML_API = 'http://127.0.0.1:8000/model_app';
 
-function BlockedIPs() {
-  const filteredAlerts = useSelector((state) => selectFilteredAlerts(state));
-  const alertStats = useSelector((state) => selectAlertStats(state));
+export default function BlockedIPsPage() {
+  const { user, isAdmin } = useAuth();
+  const [blocked, setBlocked]   = useState([]);
+  const [total, setTotal]       = useState(0);
+  const [page, setPage]         = useState(1);
+  const [loading, setLoading]   = useState(false);
+  const [activeOnly, setActiveOnly] = useState(true);
+  const [newIP, setNewIP]       = useState('');
+  const [reason, setReason]     = useState('');
+  const [opStatus, setOpStatus] = useState({});
+  const LIMIT = 50;
 
-  const sourceProfiles = useMemo(() => {
-    const profileMap = new Map();
+  const fetchBlocked = useCallback(async (pg = 1, activeF = activeOnly) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ page: pg, limit: LIMIT, active: activeF });
+      const r = await fetch(`${ML_API}/blocked_ips_db?${params}`);
+      const d = await r.json();
+      setBlocked(d.blocked_ips || []);
+      setTotal(d.total || 0);
+    } catch {}
+    setLoading(false);
+  }, []);
 
-    filteredAlerts.forEach((alert) => {
-      const sourceIp = alert.src_ip || alert.src || 'Unknown';
-      const destinationIp = alert.dst_ip || alert.dst || 'Unknown';
-      const severity = alert.final?.severity || 'Unknown';
-      const attackType = alert.final?.attack_type || 'Unknown';
-      const score = Number(alert.final?.final_score || 0);
+  useEffect(() => { fetchBlocked(1, activeOnly); }, []);
 
-      if (!profileMap.has(sourceIp)) {
-        profileMap.set(sourceIp, {
-          ip: sourceIp,
-          hits: 0,
-          highestSeverity: 'Low',
-          severityWeight: 0,
-          destinations: new Set(),
-          attackTypes: new Set(),
-          scoreTotal: 0,
-          lastSeen: null
-        });
+  const doAction = async (ip, action) => {
+    setOpStatus(s => ({ ...s, [ip]: 'loading' }));
+    try {
+      const r = await fetch(`${ML_API}/blocked_ips_db`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip, action, reason, blocked_by: user?.username || 'dashboard', unblocked_by: user?.username || 'dashboard' }),
+      });
+      const d = await r.json();
+      if (d.status === action + 'ed' || d.status === 'unblocked' || d.status === 'blocked') {
+        setOpStatus(s => ({ ...s, [ip]: 'success' }));
+        fetchBlocked(page, activeOnly);
+      } else {
+        setOpStatus(s => ({ ...s, [ip]: 'error' }));
       }
+    } catch {
+      setOpStatus(s => ({ ...s, [ip]: 'error' }));
+    }
+    setTimeout(() => setOpStatus(s => { const n = { ...s }; delete n[ip]; return n; }), 2500);
+  };
 
-      const profile = profileMap.get(sourceIp);
-      profile.hits += 1;
-      profile.destinations.add(destinationIp);
-      profile.attackTypes.add(attackType);
-      profile.scoreTotal += score;
+  const addBlock = async (e) => {
+    e.preventDefault();
+    if (!newIP) return;
+    await doAction(newIP, 'block');
+    setNewIP(''); setReason('');
+  };
 
-      const severityWeight = calculateSeverityWeight(severity);
-      if (severityWeight >= profile.severityWeight) {
-        profile.severityWeight = severityWeight;
-        profile.highestSeverity = severity;
-      }
+  const statusIcon = (ip) => {
+    const s = opStatus[ip];
+    if (s === 'loading') return '⏳';
+    if (s === 'success') return '✅';
+    if (s === 'error')   return '❌';
+    return null;
+  };
 
-      const timestamp = alert.timestamp ? new Date(alert.timestamp).getTime() : 0;
-      if (!profile.lastSeen || timestamp > profile.lastSeen) {
-        profile.lastSeen = timestamp;
-      }
-    });
-
-    return Array.from(profileMap.values())
-      .map((profile) => ({
-        ...profile,
-        destinationCount: profile.destinations.size,
-        attackTypeCount: profile.attackTypes.size,
-        riskScore: Math.round(profile.hits * 10 + profile.severityWeight * 14 + profile.scoreTotal),
-        avgScore: profile.hits ? (profile.scoreTotal / profile.hits).toFixed(2) : '0.00'
-      }))
-      .sort((left, right) => right.riskScore - left.riskScore);
-  }, [filteredAlerts]);
-
-  const destinationFocus = useMemo(() => {
-    const destinationMap = new Map();
-
-    filteredAlerts.forEach((alert) => {
-      const destinationIp = alert.dst_ip || alert.dst || 'Unknown';
-      destinationMap.set(destinationIp, (destinationMap.get(destinationIp) || 0) + 1);
-    });
-
-    return Array.from(destinationMap.entries())
-      .map(([ip, hits]) => ({ ip, hits }))
-      .sort((left, right) => right.hits - left.hits)
-      .slice(0, 8);
-  }, [filteredAlerts]);
-
-  const recentEvents = filteredAlerts.slice(0, 10);
+  const totalPages = Math.max(1, Math.ceil(total / LIMIT));
 
   return (
-    <div className="cyber-page blockedip-page">
-      <div className="blocked-layout">
-        <section className="blocked-overview cyber-panel">
-          <div className="cyber-panel-header">
-            <div>
-              <h2 className="cyber-panel-title">Blocked IP Intelligence</h2>
-              <p className="cyber-panel-subtitle">Hostile source profiling based on observed alert traffic.</p>
-            </div>
-            <span className="cyber-pill">{sourceProfiles.length} Sources</span>
-          </div>
-
-          <div className="cyber-kpi-grid blocked-kpis">
-            <div className="cyber-kpi-card">
-              <span className="cyber-kpi-label">Alert Volume</span>
-              <span className="cyber-kpi-value">{alertStats.total}</span>
-            </div>
-            <div className="cyber-kpi-card">
-              <span className="cyber-kpi-label">Attack Alerts</span>
-              <span className="cyber-kpi-value">{alertStats.attacks}</span>
-            </div>
-            <div className="cyber-kpi-card">
-              <span className="cyber-kpi-label">High Severity</span>
-              <span className="cyber-kpi-value">{alertStats.high}</span>
-            </div>
-            <div className="cyber-kpi-card">
-              <span className="cyber-kpi-label">Tracked Sources</span>
-              <span className="cyber-kpi-value">{sourceProfiles.length}</span>
-            </div>
-          </div>
-        </section>
-
-        <section className="blocked-main cyber-panel">
-          <div className="cyber-panel-header">
-            <h3 className="cyber-panel-title">Hostile Source Ranking</h3>
-            <span className="cyber-pill">Risk Ordered</span>
-          </div>
-
-          {sourceProfiles.length === 0 ? (
-            <div className="cyber-empty">No suspicious source profiles available yet.</div>
-          ) : (
-            <div className="blocked-table-scroll">
-              <table className="blocked-table">
-                <thead>
-                  <tr>
-                    <th>Source IP</th>
-                    <th>Risk Score</th>
-                    <th>Hits</th>
-                    <th>Severity</th>
-                    <th>Targets</th>
-                    <th>Attack Types</th>
-                    <th>Avg Score</th>
-                    <th>Last Seen</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sourceProfiles.slice(0, 24).map((profile) => (
-                    <tr key={profile.ip}>
-                      <td>
-                        <code>{profile.ip}</code>
-                      </td>
-                      <td>{profile.riskScore}</td>
-                      <td>{profile.hits}</td>
-                      <td>
-                        <span className={`blocked-severity ${(profile.highestSeverity || 'low').toLowerCase()}`}>{profile.highestSeverity}</span>
-                      </td>
-                      <td>{profile.destinationCount}</td>
-                      <td>{profile.attackTypeCount}</td>
-                      <td>{profile.avgScore}</td>
-                      <td>{profile.lastSeen ? new Date(profile.lastSeen).toLocaleTimeString() : 'N/A'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-
-        <aside className="blocked-side">
-          <article className="blocked-side-card cyber-panel">
-            <div className="cyber-panel-header">
-              <h3 className="cyber-panel-title">Most Targeted Destinations</h3>
-              <span className="cyber-pill">Top 8</span>
-            </div>
-            {destinationFocus.length === 0 ? (
-              <div className="cyber-empty">No destination hotspots detected.</div>
-            ) : (
-              <ul className="cyber-list">
-                {destinationFocus.map((destination) => (
-                  <li key={destination.ip} className="cyber-list-item blocked-list-item">
-                    <code>{destination.ip}</code>
-                    <strong>{destination.hits} hits</strong>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </article>
-
-          <article className="blocked-side-card cyber-panel">
-            <div className="cyber-panel-header">
-              <h3 className="cyber-panel-title">Recent Suspicious Events</h3>
-              <span className="cyber-pill">Latest 10</span>
-            </div>
-            {recentEvents.length === 0 ? (
-              <div className="cyber-empty">No recent suspicious events.</div>
-            ) : (
-              <ul className="cyber-list blocked-event-list">
-                {recentEvents.map((alert, index) => (
-                  <li key={alert.id || index} className="cyber-list-item blocked-event-item">
-                    <div>
-                      <p>{alert.final?.attack_type || 'Unknown Attack'}</p>
-                      <small>
-                        {alert.src_ip || 'N/A'} -&gt; {alert.dst_ip || 'N/A'}
-                      </small>
-                    </div>
-                    <span className={`blocked-severity ${(alert.final?.severity || 'low').toLowerCase()}`}>{alert.final?.severity || 'Unknown'}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </article>
-        </aside>
+    <div className="sf-page anim-fade-in">
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 12, marginBottom: 24 }}>
+        <div>
+          <h2 style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>🔒 Blocked IPs</h2>
+          <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginTop: 4 }}>
+            System-level firewall rules via <code style={{ fontSize: '0.8rem' }}>netsh advfirewall</code> · {total.toLocaleString()} records
+          </p>
+        </div>
+        <button className="sf-btn sf-btn-ghost" onClick={() => fetchBlocked(page, activeOnly)} disabled={loading}>⟳ Refresh</button>
       </div>
+
+      {/* KPI */}
+      <div className="sf-kpi-grid" style={{ marginBottom: 22 }}>
+        <div className="sf-kpi-card"><span className="sf-kpi-label">Total Blocks</span><span className="sf-kpi-value danger">{total}</span></div>
+        <div className="sf-kpi-card"><span className="sf-kpi-label">Active Blocks</span><span className="sf-kpi-value warning">{blocked.filter(b => b.is_active).length}</span></div>
+        <div className="sf-kpi-card"><span className="sf-kpi-label">Unblocked</span><span className="sf-kpi-value">{blocked.filter(b => !b.is_active).length}</span></div>
+      </div>
+
+      {/* Manual block form (admin only) */}
+      {isAdmin && (
+        <div className="sf-card" style={{ padding: '16px 20px', marginBottom: 20 }}>
+          <div className="sf-panel-header" style={{ marginBottom: 14 }}>
+            <div>
+              <div className="sf-panel-title">Block an IP</div>
+              <div className="sf-panel-subtitle">Instantly add a system-level firewall rule</div>
+            </div>
+          </div>
+          <form onSubmit={addBlock} style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+            <div style={{ flex: '1 1 180px' }}>
+              <label className="sf-label">IP Address</label>
+              <input className="sf-input" type="text" placeholder="e.g. 192.168.1.1" value={newIP} onChange={e => setNewIP(e.target.value)} required pattern="\d+\.\d+\.\d+\.\d+" />
+            </div>
+            <div style={{ flex: '2 1 240px' }}>
+              <label className="sf-label">Reason (optional)</label>
+              <input className="sf-input" type="text" placeholder="e.g. Suspicious port scan detected" value={reason} onChange={e => setReason(e.target.value)} />
+            </div>
+            <button type="submit" className="sf-btn sf-btn-danger">🚫 Block IP</button>
+          </form>
+        </div>
+      )}
+
+      {/* Filter */}
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 16, flexWrap: 'wrap' }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', userSelect: 'none', fontSize: '0.84rem', color: 'var(--text-secondary)' }}>
+          <input type="checkbox" checked={activeOnly} style={{ accentColor: 'var(--accent)' }}
+            onChange={e => { setActiveOnly(e.target.checked); setPage(1); fetchBlocked(1, e.target.checked); }} />
+          Show active blocks only
+        </label>
+      </div>
+
+      {/* Table */}
+      <div className="sf-card" style={{ padding: 0, overflow: 'hidden' }}>
+        <div className="sf-table-wrap">
+          <table className="sf-table">
+            <thead>
+              <tr>
+                <th>IP Address</th>
+                <th>Status</th>
+                <th>Reason</th>
+                <th>Blocked By</th>
+                <th>Blocked At</th>
+                <th>Unblocked At</th>
+                {isAdmin && <th>Actions</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {loading ? (
+                <tr><td colSpan={isAdmin ? 7 : 6} style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>Loading…</td></tr>
+              ) : blocked.length === 0 ? (
+                <tr><td colSpan={isAdmin ? 7 : 6} style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>No blocked IPs {activeOnly ? 'currently' : 'on record'}.</td></tr>
+              ) : blocked.map(b => (
+                <tr key={b.id}>
+                  <td><code>{b.ip}</code></td>
+                  <td>
+                    <span className={`sf-pill ${b.is_active ? 'sf-pill-high' : 'sf-pill-normal'}`}>
+                      {b.is_active ? 'ACTIVE' : 'UNBLOCKED'}
+                    </span>
+                  </td>
+                  <td style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {b.reason || '—'}
+                  </td>
+                  <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{b.blocked_by || 'system'}</td>
+                  <td style={{ fontSize: '0.78rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                    {b.blocked_at ? new Date(b.blocked_at * 1000).toLocaleString() : '—'}
+                  </td>
+                  <td style={{ fontSize: '0.78rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                    {b.unblocked_at ? new Date(b.unblocked_at * 1000).toLocaleString() : '—'}
+                  </td>
+                  {isAdmin && (
+                    <td>
+                      {b.is_active ? (
+                        <button className="sf-btn sf-btn-ghost sf-btn-sm"
+                          style={{ color: 'var(--success)', borderColor: 'rgba(0,230,118,0.4)' }}
+                          onClick={() => doAction(b.ip, 'unblock')}
+                          disabled={opStatus[b.ip] === 'loading'}>
+                          {statusIcon(b.ip) || '🔓 Unblock'}
+                        </button>
+                      ) : (
+                        <button className="sf-btn sf-btn-danger sf-btn-sm"
+                          onClick={() => doAction(b.ip, 'block')}
+                          disabled={opStatus[b.ip] === 'loading'}>
+                          {statusIcon(b.ip) || '🚫 Re-block'}
+                        </button>
+                      )}
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div className="sf-pagination">
+          <button className="sf-page-btn" onClick={() => { setPage(1); fetchBlocked(1, activeOnly); }} disabled={page === 1}>«</button>
+          <button className="sf-page-btn" onClick={() => { const p = page - 1; setPage(p); fetchBlocked(p, activeOnly); }} disabled={page === 1}>‹</button>
+          <span style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>Page {page} / {totalPages}</span>
+          <button className="sf-page-btn" onClick={() => { const p = page + 1; setPage(p); fetchBlocked(p, activeOnly); }} disabled={page === totalPages}>›</button>
+          <button className="sf-page-btn" onClick={() => { setPage(totalPages); fetchBlocked(totalPages, activeOnly); }} disabled={page === totalPages}>»</button>
+        </div>
+      )}
     </div>
   );
 }
-
-export default BlockedIPs;

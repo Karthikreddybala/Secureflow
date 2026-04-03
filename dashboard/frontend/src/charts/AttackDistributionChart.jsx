@@ -1,132 +1,89 @@
 import React, { useState, useEffect } from 'react';
-import { Card, CardHeader, CardBody } from 'react-bootstrap';
 import chartDataManager from '../server/chartDataManager.js';
 
-const PIE_CENTER = 150;
-const PIE_RADIUS = 118;
+const C = 80, R = 62;
+
+function buildSegments(normal, attacks) {
+  const total = normal + attacks;
+  if (!total) return [];
+  const items = [
+    { name: 'Normal', value: normal, color: '#41e28f' },
+    { name: 'Attack', value: attacks, color: '#ff5d73' },
+  ];
+  let start = -Math.PI / 2;
+  return items.map(({ name, value, color }) => {
+    let a = (value / total) * 2 * Math.PI;
+    if (a >= 2 * Math.PI) a = 2 * Math.PI - 0.001;
+    const end = start + a;
+    const x1 = C + R * Math.cos(start), y1 = C + R * Math.sin(start);
+    const x2 = C + R * Math.cos(end),   y2 = C + R * Math.sin(end);
+    const path = `M${C} ${C} L${x1} ${y1} A${R} ${R} 0 ${a > Math.PI ? 1 : 0} 1 ${x2} ${y2}Z`;
+    start = end;
+    return { name, value, color, path };
+  });
+}
 
 function AttackDistributionChart() {
-    const [attackData, setAttackData] = useState({
-        normal: 0,
-        attacks: 0,
-        total: 0
-    });
+  const [data, setData] = useState({ normal: 0, attacks: 0, total: 0 });
 
-    useEffect(() => {
-        const updateAttackData = () => {
-            const data = chartDataManager.getAttackData();
-            setAttackData(data);
-        };
+  useEffect(() => {
+    const tick = () => setData(chartDataManager.getAttackData());
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, []);
 
-        updateAttackData();
-        const interval = setInterval(updateAttackData, 1000);
+  const segments = buildSegments(data.normal, data.attacks);
+  const attackPct = data.total ? ((data.attacks / data.total) * 100).toFixed(1) : '0.0';
+  const normalPct = data.total ? ((data.normal / data.total) * 100).toFixed(1) : '0.0';
+  const isUnderAttack = data.attacks > 0;
 
-        return () => clearInterval(interval);
-    }, []);
+  return (
+    <div className="chart-card">
+      <div className="chart-card-header">
+        <h5>Attack Distribution</h5>
+        <span className="chart-pill" style={{ color: isUnderAttack ? '#ff5d73' : '#41e28f', borderColor: isUnderAttack ? 'rgba(255,93,115,0.5)' : 'rgba(65,226,143,0.5)', background: isUnderAttack ? 'rgba(255,93,115,0.1)' : 'rgba(65,226,143,0.1)' }}>
+          {isUnderAttack ? '⚠ ATTACK' : '✓ NORMAL'}
+        </span>
+      </div>
 
-    const calculatePieSegments = () => {
-        const total = attackData.normal + attackData.attacks;
-        if (total === 0) return [];
+      <div className="chart-card-body" style={{ flexDirection: 'row', alignItems: 'center', gap: 14, padding: '8px 14px' }}>
+        {/* Compact donut */}
+        <svg viewBox="0 0 160 160" style={{ width: 120, height: 120, flexShrink: 0 }}>
+          {segments.length ? segments.map(s => (
+            <path key={s.name} d={s.path} fill={s.color} stroke="rgba(6,20,35,0.9)" strokeWidth="1.5" opacity="0.95" />
+          )) : (
+            <circle cx={C} cy={C} r={R} fill="rgba(20,40,65,0.7)" />
+          )}
+          <circle cx={C} cy={C} r="38" fill="rgba(10,24,41,0.98)" stroke="rgba(95,139,184,0.3)" strokeWidth="1.5" />
+          <text x={C} y={C - 6} textAnchor="middle" fontSize="8" fill="#90abc7">attack ratio</text>
+          <text x={C} y={C + 11} textAnchor="middle" fontSize="18" fontWeight="700" fill={isUnderAttack ? '#ff5d73' : '#41e28f'}>{attackPct}%</text>
+        </svg>
 
-        const attackTypes = [
-            { name: 'Normal', value: attackData.normal, color: '#41e28f' },
-            { name: 'Attack', value: attackData.attacks, color: '#ff5d73' }
-        ];
-
-        let startAngle = -Math.PI / 2;
-        const segments = [];
-
-        attackTypes.forEach((type) => {
-            const percentage = type.value / total;
-            let angle = percentage * 2 * Math.PI;
-            if (angle >= 2 * Math.PI) {
-                angle = 2 * Math.PI - 0.0001;
-            }
-
-            const endAngle = startAngle + angle;
-            const x1 = PIE_CENTER + PIE_RADIUS * Math.cos(startAngle);
-            const y1 = PIE_CENTER + PIE_RADIUS * Math.sin(startAngle);
-            const x2 = PIE_CENTER + PIE_RADIUS * Math.cos(endAngle);
-            const y2 = PIE_CENTER + PIE_RADIUS * Math.sin(endAngle);
-            const largeArcFlag = angle > Math.PI ? 1 : 0;
-
-            const pathData = [
-                `M ${PIE_CENTER} ${PIE_CENTER}`,
-                `L ${x1} ${y1}`,
-                `A ${PIE_RADIUS} ${PIE_RADIUS} 0 ${largeArcFlag} 1 ${x2} ${y2}`,
-                'Z'
-            ].join(' ');
-
-            segments.push({
-                ...type,
-                percentage: percentage * 100,
-                pathData
-            });
-
-            startAngle = endAngle;
-        });
-
-        return segments;
-    };
-
-    const segments = calculatePieSegments();
-    const attackPct = attackData.total ? ((attackData.attacks / attackData.total) * 100).toFixed(1) : '0.0';
-    const normalPct = attackData.total ? ((attackData.normal / attackData.total) * 100).toFixed(1) : '0.0';
-
-    return (
-        <Card className="chart-card">
-            <CardHeader className="chart-card-header">
-                <h5>Attack Distribution</h5>
-                <span className="chart-pill">{attackData.total} TOTAL</span>
-            </CardHeader>
-
-            <CardBody className="chart-card-body">
-                <div className="pie-stage">
-                    <svg className="pie-svg" viewBox="0 0 300 300" preserveAspectRatio="xMidYMid meet">
-                        {segments.map((segment) => (
-                            <path
-                                key={segment.name}
-                                d={segment.pathData}
-                                fill={segment.color}
-                                stroke="rgba(6, 20, 35, 0.9)"
-                                strokeWidth="2"
-                                opacity="0.96"
-                            />
-                        ))}
-
-                        <circle cx={PIE_CENTER} cy={PIE_CENTER} r="62" fill="rgba(10, 24, 41, 0.98)" stroke="rgba(95, 139, 184, 0.45)" strokeWidth="2" />
-
-                        <text x={PIE_CENTER} y="140" textAnchor="middle" fontSize="13" fill="#90abc7">
-                            Security Signal
-                        </text>
-                        <text x={PIE_CENTER} y="162" textAnchor="middle" fontSize="20" fontWeight="700" fill="#d7ecff">
-                            {attackData.attacks > 0 ? 'UNDER ATTACK' : 'NORMAL'}
-                        </text>
-                        <text x={PIE_CENTER} y="179" textAnchor="middle" fontSize="11" fill="#90abc7">
-                            attack ratio {attackPct}%
-                        </text>
-                    </svg>
-                </div>
-
-                <div className="pie-summary-grid attack">
-                    <div className="pie-summary-item" style={{ borderColor: '#41e28f66' }}>
-                        <span className="name" style={{ color: '#41e28f' }}>
-                            Normal
-                        </span>
-                        <span className="value">{attackData.normal}</span>
-                        <span className="pct">{normalPct}%</span>
-                    </div>
-                    <div className="pie-summary-item" style={{ borderColor: '#ff5d7366' }}>
-                        <span className="name" style={{ color: '#ff5d73' }}>
-                            Attack
-                        </span>
-                        <span className="value">{attackData.attacks}</span>
-                        <span className="pct">{attackPct}%</span>
-                    </div>
-                </div>
-            </CardBody>
-        </Card>
-    );
+        {/* Stats */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#41e28f', flexShrink: 0 }} />
+              <span style={{ fontSize: '0.76rem', color: '#90abc7', flex: 1 }}>Normal</span>
+              <span style={{ fontSize: '0.76rem', fontWeight: 700, color: '#d7ecff' }}>{data.normal}</span>
+              <span style={{ fontSize: '0.7rem', color: '#7e9cbd', minWidth: 38, textAlign: 'right' }}>{normalPct}%</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#ff5d73', flexShrink: 0 }} />
+              <span style={{ fontSize: '0.76rem', color: '#90abc7', flex: 1 }}>Attack</span>
+              <span style={{ fontSize: '0.76rem', fontWeight: 700, color: '#d7ecff' }}>{data.attacks}</span>
+              <span style={{ fontSize: '0.7rem', color: '#7e9cbd', minWidth: 38, textAlign: 'right' }}>{attackPct}%</span>
+            </div>
+          </div>
+          <div style={{ borderTop: '1px solid rgba(95,139,184,0.2)', paddingTop: 8 }}>
+            <div style={{ fontSize: '0.68rem', color: '#90abc7' }}>Total analyzed</div>
+            <div style={{ fontSize: '1.1rem', fontWeight: 700, color: '#d7ecff' }}>{data.total}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default AttackDistributionChart;

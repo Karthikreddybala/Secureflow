@@ -1,0 +1,48 @@
+/* ThreatLeaderboard.css */
+.threat-leaderboard {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 12px;
+  padding: 16px;
+  margin-top: 16px;
+}
+
+.tlb-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 14px;
+}
+.tlb-header > span:first-child {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #e6edf3;
+}
+.tlb-sub { font-size: 0.75rem; color: #8b949e; }
+
+.tlb-row {
+  display: grid;
+  grid-template-columns: 20px 110px 1fr 36px 80px;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid #21262d;
+}
+.tlb-row:last-child { border-bottom: none; }
+
+.tlb-rank  { font-size: 0.75rem; color: #484f58; font-weight: 700; }
+.tlb-ip    { font-family: monospace; font-size: 0.8rem; color: #58a6ff; word-break: break-all; }
+.tlb-bar-wrap {
+  height: 6px;
+  background: #21262d;
+  border-radius: 3px;
+  overflow: hidden;
+}
+.tlb-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.5s ease;
+  min-width: 2px;
+}
+.tlb-score  { font-size: 0.8rem; font-weight: 700; text-align: right; }
+.tlb-attacks { font-size: 0.7rem; color: #8b949e; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

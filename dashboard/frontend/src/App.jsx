@@ -1,53 +1,77 @@
 import React, { useEffect } from 'react';
-import { BrowserRouter as Router, Routes, Route } from 'react-router-dom'
-import { Provider } from 'react-redux'
-import './App.css'
+import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
+import { Provider } from 'react-redux';
+import './App.css';
 import 'bootstrap/dist/css/bootstrap.min.css';
 import 'bootstrap/dist/js/bootstrap.bundle.min';
-import Header from './header.jsx'
-import Home from './pages/home.jsx'
-import RealTimeTraffic from './pages/RealTimeTraffic.jsx'
-import BlockedIPs from './pages/BlockedIPs.jsx'
-import AttackAnalytics from './pages/AttackAnalytics.jsx'
-// import Profile from './pages/Profile.jsx'
-// import Settings from './pages/Settings.jsx'
-// import Info from './pages/Info.jsx'
-import Login from './pages/login.jsx'
-import Register from './pages/register.jsx'
+import { AuthProvider, useAuth } from './context/AuthContext';
+import ProtectedRoute from './components/ProtectedRoute';
+import Header from './header.jsx';
 import Dashboard from './pages/dashboard.jsx';
-import { store } from './store/index.js'
-import globalSocketManager from './server/globalSocketManager.js'
+import RealTimeTraffic from './pages/RealTimeTraffic.jsx';
+import BlockedIPs from './pages/BlockedIPs.jsx';
+import AttackAnalytics from './pages/AttackAnalytics.jsx';
+import AlertsPage from './pages/AlertsPage.jsx';
+import NetworkFlows from './pages/NetworkFlows.jsx';
+import Login from './pages/login.jsx';
+import Register from './pages/register.jsx';
+import AdminUsers from './pages/AdminUsers.jsx';
+import { store } from './store/index.js';
+import globalSocketManager from './server/globalSocketManager.js';
 
-function App() {
+/** Inner wrapper that initializes websocket after auth check */
+function AppInner() {
   useEffect(() => {
-    // Initialize global socket manager with Redux dispatch
     globalSocketManager.init(store.dispatch);
-    
-    // Cleanup on app unmount
-    return () => {
-      globalSocketManager.disconnect();
-    };
+    return () => globalSocketManager.disconnect();
   }, []);
 
   return (
-    <Provider store={store}>
-      <Router>
-        <Header />
+    <Router>
+      <Routes>
+        {/* Public Routes */}
+        <Route path="/login"    element={<Login />} />
+        <Route path="/register" element={<Register />} />
+
+        {/* Protected layout (sidebar + content) */}
+        <Route path="/*" element={
+          <ProtectedRoute>
+            <LayoutWithSidebar />
+          </ProtectedRoute>
+        } />
+      </Routes>
+    </Router>
+  );
+}
+
+function LayoutWithSidebar() {
+  return (
+    <div style={{ display: 'flex', minHeight: '100vh' }}>
+      <Header />
+      <main style={{ flex: 1, marginLeft: 'var(--sidebar-w, 220px)', minHeight: '100vh', transition: 'margin-left 0.25s cubic-bezier(0.4,0,0.2,1)', overflowX: 'hidden' }}>
         <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/login" element={<Login />} />
-          <Route path="/register" element={<Register />} />
-          <Route path="/dashboard" element={<Dashboard />} />
-          <Route path="/traffic" element={<RealTimeTraffic />} />
-          <Route path="/blocked-ips" element={<BlockedIPs />} />
-          <Route path="/analytics" element={<AttackAnalytics />} />
-          {/* <Route path="/profile" element={<Profile />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="/info" element={<Info />} /> */}
+          <Route path="/"              element={<Navigate to="/dashboard" replace />} />
+          <Route path="/dashboard"     element={<Dashboard />} />
+          <Route path="/traffic"       element={<RealTimeTraffic />} />
+          <Route path="/blocked-ips"   element={<BlockedIPs />} />
+          <Route path="/analytics"     element={<AttackAnalytics />} />
+          <Route path="/alerts"        element={<AlertsPage />} />
+          <Route path="/flows"         element={<NetworkFlows />} />
+          <Route path="/admin/users"   element={<ProtectedRoute adminOnly><AdminUsers /></ProtectedRoute>} />
         </Routes>
-      </Router>
+      </main>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <Provider store={store}>
+      <AuthProvider>
+        <AppInner />
+      </AuthProvider>
     </Provider>
-  )
+  );
 }
 
 export default App;

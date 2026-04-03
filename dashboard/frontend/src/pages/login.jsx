@@ -1,112 +1,145 @@
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Loginapi } from '../server/api.js';
-import './css/login.css';
+import React, { useState, useEffect, useRef } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
 
-function Login() {
-  const navigate = useNavigate();
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [keepSignedIn, setKeepSignedIn] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [errorMessage, setErrorMessage] = useState('');
+export default function Login() {
+  const { login, user } = useAuth();
+  const navigate        = useNavigate();
+  const location        = useLocation();
+  const canvasRef       = useRef(null);
+  const [form, setForm] = useState({ username: '', password: '' });
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
 
-  const handleSubmit = async (event) => {
-    event.preventDefault();
-    setErrorMessage('');
+  // Redirect if already logged in
+  useEffect(() => {
+    if (user) navigate(location.state?.from?.pathname || '/dashboard', { replace: true });
+  }, [user, navigate, location]);
 
-    if (!email.trim() || !password.trim()) {
-      setErrorMessage('Enter both email and password to continue.');
-      return;
-    }
+  // Particle canvas animation
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    let animId;
+    const resize = () => { canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight; };
+    resize();
+    window.addEventListener('resize', resize);
 
-    try {
-      setIsSubmitting(true);
-      const response = await Loginapi(email, password);
+    const DOTS = Array.from({ length: 60 }, () => ({
+      x: Math.random() * canvas.width, y: Math.random() * canvas.height,
+      vx: (Math.random() - 0.5) * 0.4, vy: (Math.random() - 0.5) * 0.4,
+      r: Math.random() * 1.5 + 0.5,
+    }));
 
-      if (response && response.status === 'success') {
-        navigate('/dashboard');
-        return;
-      }
+    const draw = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      DOTS.forEach(d => {
+        d.x += d.vx; d.y += d.vy;
+        if (d.x < 0) d.x = canvas.width;
+        if (d.x > canvas.width) d.x = 0;
+        if (d.y < 0) d.y = canvas.height;
+        if (d.y > canvas.height) d.y = 0;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(0,245,212,0.5)';
+        ctx.fill();
+      });
+      DOTS.forEach((a, i) => DOTS.slice(i + 1).forEach(b => {
+        const dist = Math.hypot(a.x - b.x, a.y - b.y);
+        if (dist < 120) {
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+          ctx.strokeStyle = `rgba(0,245,212,${0.15 * (1 - dist / 120)})`;
+          ctx.lineWidth = 0.6; ctx.stroke();
+        }
+      }));
+      animId = requestAnimationFrame(draw);
+    };
+    draw();
+    return () => { window.removeEventListener('resize', resize); cancelAnimationFrame(animId); };
+  }, []);
 
-      setErrorMessage('Login failed. Check your credentials and try again.');
-    } catch {
-      setErrorMessage('Unable to reach authentication service. Try again shortly.');
-    } finally {
-      setIsSubmitting(false);
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    const result = await login(form.username, form.password);
+    setLoading(false);
+    if (result.success) {
+      navigate('/dashboard');
+    } else {
+      setError(result.error || 'Login failed');
     }
   };
 
   return (
-    <div className="cyber-page auth-page">
-      <div className="auth-shell">
-        <section className="auth-left cyber-panel">
-          <span className="auth-chip">Secure Access Layer</span>
-          <h1>Authenticate into your network defense control room.</h1>
-          <p>
-            Access live telemetry, attack insights, and incident response workflows from a hardened operations interface.
-          </p>
+    <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-base)', overflow: 'hidden' }}>
+      {/* Particle Canvas */}
+      <canvas ref={canvasRef} style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', zIndex: 0 }} />
 
-          <ul className="auth-value-list">
-            <li>Real-time threat visibility with centralized dashboards</li>
-            <li>Live WebSocket ingestion for alerts and packet events</li>
-            <li>Actionable severity intelligence for analyst triage</li>
-          </ul>
-        </section>
+      {/* Glow orbs */}
+      <div style={{ position: 'absolute', top: '15%', left: '20%', width: 400, height: 400, borderRadius: '50%', background: 'radial-gradient(circle, rgba(0,245,212,0.07) 0%, transparent 70%)', zIndex: 0 }} />
+      <div style={{ position: 'absolute', bottom: '10%', right: '15%', width: 350, height: 350, borderRadius: '50%', background: 'radial-gradient(circle, rgba(123,47,255,0.07) 0%, transparent 70%)', zIndex: 0 }} />
 
-        <section className="auth-right cyber-panel">
-          <div className="auth-form-header">
-            <h2>Login Account</h2>
-            <p>Use your analyst credentials to continue.</p>
+      {/* Login Card */}
+      <div style={{
+        position: 'relative', zIndex: 10, width: '100%', maxWidth: 420,
+        background: 'rgba(8,14,31,0.88)', border: '1px solid rgba(0,245,212,0.2)',
+        borderRadius: 24, padding: '44px 40px', boxShadow: '0 8px 64px rgba(0,0,0,0.7), 0 0 0 1px rgba(0,245,212,0.06)',
+        backdropFilter: 'blur(24px)',
+        animation: 'fadeInUp 0.5s ease both',
+      }}>
+        {/* Logo */}
+        <div style={{ textAlign: 'center', marginBottom: 36 }}>
+          <div style={{ fontSize: '2.8rem', marginBottom: 8, lineHeight: 1 }}>⬡</div>
+          <h1 style={{ fontSize: '1.6rem', fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
+            Secure<span style={{ color: 'var(--accent)' }}>Flow</span>
+          </h1>
+          <p style={{ color: 'var(--text-muted)', fontSize: '0.82rem', marginTop: 6 }}>Intrusion Detection System</p>
+        </div>
+
+        {error && (
+          <div style={{ background: 'rgba(255,69,96,0.12)', border: '1px solid rgba(255,69,96,0.3)', borderRadius: 8, padding: '10px 14px', color: 'var(--danger)', fontSize: '0.85rem', marginBottom: 20 }}>
+            ⚠ {error}
           </div>
+        )}
 
-          <form className="auth-form" onSubmit={handleSubmit}>
-            <label htmlFor="login-email">Email</label>
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+          <div>
+            <label className="sf-label">Email / Username</label>
             <input
-              id="login-email"
-              type="email"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              placeholder="analyst@secureflow.ai"
-              autoComplete="email"
+              className="sf-input" type="email" placeholder="admin@secureflow.io"
+              value={form.username} onChange={e => setForm(f => ({ ...f, username: e.target.value }))}
+              required autoFocus
             />
-
-            <label htmlFor="login-password">Password</label>
+          </div>
+          <div>
+            <label className="sf-label">Password</label>
             <input
-              id="login-password"
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              placeholder="Enter password"
-              autoComplete="current-password"
+              className="sf-input" type="password" placeholder="••••••••"
+              value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))}
+              required
             />
+          </div>
+          <button
+            type="submit" className="sf-btn sf-btn-primary"
+            style={{ width: '100%', justifyContent: 'center', padding: '12px', fontSize: '0.95rem', marginTop: 4 }}
+            disabled={loading}
+          >
+            {loading ? 'Authenticating…' : '→ Sign In'}
+          </button>
+        </form>
 
-            <div className="auth-form-row">
-              <label className="auth-checkbox" htmlFor="keep-signed-in">
-                <input
-                  id="keep-signed-in"
-                  type="checkbox"
-                  checked={keepSignedIn}
-                  onChange={(event) => setKeepSignedIn(event.target.checked)}
-                />
-                Keep me signed in
-              </label>
+        <p style={{ textAlign: 'center', marginTop: 22, color: 'var(--text-muted)', fontSize: '0.8rem' }}>
+          Don't have an account? <a href="/register" style={{ color: 'var(--accent)', textDecoration: 'none', fontWeight: 600 }}>Register</a>
+        </p>
 
-              <button type="button" className="auth-link-btn" onClick={() => navigate('/register')}>
-                Create account
-              </button>
-            </div>
-
-            {errorMessage && <p className="auth-error">{errorMessage}</p>}
-
-            <button type="submit" className="auth-submit-btn" disabled={isSubmitting}>
-              {isSubmitting ? 'Authenticating...' : 'Login'}
-            </button>
-          </form>
-        </section>
+        <div style={{ marginTop: 28, paddingTop: 20, borderTop: '1px solid var(--border)', display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
+          {['ML Detection', 'Real-time IDS', 'MITRE ATT&CK'].map(l => (
+            <span key={l} className="sf-pill sf-pill-live" style={{ fontSize: '0.68rem' }}>{l}</span>
+          ))}
+        </div>
       </div>
     </div>
   );
 }
-
-export default Login;

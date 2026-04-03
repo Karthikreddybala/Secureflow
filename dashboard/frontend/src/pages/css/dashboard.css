@@ -11,10 +11,10 @@
 }
 
 .dashboard-page {
-  --header-height: 68px;
-  height: calc(100vh - var(--header-height));
+  --header-height: 0px;
+  height: 100vh;
   min-height: 0;
-  padding: 8px;
+  padding: 10px 12px;
   background: var(--dashboard-bg);
   overflow: hidden;
 }
@@ -41,7 +41,7 @@
 }
 
 .dashboard-col-2 {
-  grid-template-rows: minmax(0, 1.42fr) minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) 160px 160px auto;
 }
 
 .dashboard-row,
@@ -56,6 +56,7 @@
 .pie-stage {
   min-height: 0;
   min-width: 0;
+  overflow: hidden;
 }
 
 .dashboard-panel,
@@ -551,3 +552,20 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* New Feature Styles */
+.alert-mitre { display: flex; gap: 5px; align-items: center; margin: 4px 0; }
+.mitre-id-badge { background: rgba(31,111,235,.18); border: 1px solid rgba(31,111,235,.5); color: #58a6ff; font-family: monospace; font-size: .68rem; padding: 1px 6px; border-radius: 4px; font-weight: 700; }
+.mitre-tactic-badge { background: rgba(30,30,50,.6); border: 1px solid rgba(88,136,188,.3); color: #90abc7; font-size: .65rem; padding: 1px 6px; border-radius: 4px; }
+.alert-shap { display: flex; flex-wrap: wrap; gap: 4px; margin: 3px 0 5px; }
+.shap-chip { font-size: .62rem; padding: 1px 5px; border-radius: 3px; font-family: monospace; }
+.shap-chip.pos { background: rgba(65,226,143,.12); border: 1px solid rgba(65,226,143,.4); color: #41e28f; }
+.shap-chip.neg { background: rgba(255,93,115,.12); border: 1px solid rgba(255,93,115,.4); color: #ff5d73; }
+.abuse-chip { font-size: .65rem; font-weight: 700; }
+.block-btn-sm { background: rgba(218,54,51,.15); border: 1px solid rgba(218,54,51,.5); color: #ff6b6b; font-size: .65rem; padding: 2px 7px; border-radius: 4px; cursor: pointer; transition: all .2s; white-space: nowrap; }
+.block-btn-sm:hover { background: #da3633; color: #fff; }
+.export-btn { background: rgba(32,216,222,.12); border: 1px solid rgba(32,216,222,.5); color: #20d8de; padding: 4px 12px; border-radius: 6px; font-size: .78rem; font-weight: 700; cursor: pointer; transition: all .2s; }
+.export-btn:hover:not(:disabled) { background: rgba(32,216,222,.25); }
+.export-btn.pdf { background: rgba(255,93,115,.12); border-color: rgba(255,93,115,.5); color: #ff5d73; }
+.export-btn.pdf:hover:not(:disabled) { background: rgba(255,93,115,.25); }
+.export-btn:disabled { opacity: .5; cursor: not-allowed; }
